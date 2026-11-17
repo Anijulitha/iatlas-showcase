@@ -1,0 +1,412 @@
+"""Candidate model for invoice extraction.
+
+Extractors propose evidence here instead of mutating final invoice fields.
+
+The CandidatePool deliberately does NOT resolve conflicts or choose winners.
+It only stores evidence. Resolution belongs to the final resolver.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any
+
+
+class CandidateKind(str, Enum):
+    """
+    Semantic origin of a candidate.
+
+    LOCKED:
+        Hard evidence. It may not be replaced by extracted/derived evidence.
+
+    EXTRACTED:
+        Evidence directly obtained from OCR, regex, LLM, templates, etc.
+        Competes by confidence.
+
+    DERIVED:
+        Evidence calculated/inferred from other evidence.
+        May fill an empty field but must never override LOCKED evidence.
+    """
+
+    LOCKED = "locked"
+    EXTRACTED = "extracted"
+    DERIVED = "derived"
+
+
+@dataclass
+class Candidate:
+    field: str
+    value: Any
+    source: str
+    confidence: float = 0.0
+    kind: CandidateKind = CandidateKind.EXTRACTED
+    evidence: dict[str, Any] = field(default_factory=dict)
+
+    rejected: bool = False
+    rejection_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        self.confidence = normalize_confidence(self.confidence)
+
+        if not isinstance(self.kind, CandidateKind):
+            self.kind = CandidateKind(str(self.kind))
+
+    @property
+    def active(self) -> bool:
+        """Whether this candidate is still eligible for resolution."""
+        return not self.rejected
+
+    @property
+    def locked(self) -> bool:
+        """Whether this candidate represents hard evidence."""
+        return self.kind == CandidateKind.LOCKED
+
+
+def normalize_confidence(value: Any) -> float:
+    """
+    Normalize confidence to the canonical [0.0, 1.0] range.
+
+    During migration we tolerate legacy 0-100 scores.
+    """
+
+    try:
+        confidence = float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+    # Migration compatibility:
+    # 95 -> 0.95
+    if confidence > 1.0 and confidence <= 100.0:
+        confidence /= 100.0
+
+    return max(0.0, min(1.0, confidence))
+
+
+class CandidatePool:
+    """
+    Evidence-only storage.
+
+    IMPORTANT:
+        CandidatePool never chooses a winner.
+        CandidatePool never writes final invoice fields.
+        CandidatePool never resolves roles.
+
+    Those decisions belong to resolver_final / identity resolver.
+    """
+
+    def __init__(self) -> None:
+        self._items: dict[str, list[Candidate]] = {}
+
+    def propose(
+        self,
+        field: str,
+        value: Any,
+        source: str,
+        confidence: float = 0.0,
+        kind: CandidateKind | str = CandidateKind.EXTRACTED,
+        evidence: dict[str, Any] | None = None,
+    ) -> Candidate | None:
+        """
+        Add evidence to the pool.
+
+        Empty values are ignored because they are absence of evidence,
+        not candidates.
+        """
+
+        if value is None or value == "":
+            return None
+
+        if not isinstance(kind, CandidateKind):
+            kind = CandidateKind(str(kind))
+
+        candidate = Candidate(
+            field=str(field),
+            value=value,
+            source=str(source or "unknown"),
+            confidence=confidence,
+            kind=kind,
+            evidence=dict(evidence or {}),
+        )
+
+        self._items.setdefault(candidate.field, []).append(candidate)
+
+        return candidate
+
+    def reject(
+        self,
+        field: str,
+        candidate: Candidate,
+        reason: str,
+    ) -> None:
+        """
+        Preserve the candidate but mark it as rejected.
+
+        Rejected evidence remains available for diagnostics/auditing.
+        """
+
+        if candidate.field != field:
+            raise ValueError(
+                f"Candidate belongs to field {candidate.field!r}, "
+                f"not {field!r}"
+            )
+
+        candidate.rejected = True
+        candidate.rejection_reason = str(reason)
+
+    def by_field(self, field: str) -> list[Candidate]:
+        """Return all candidates, including rejected evidence."""
+        return list(self._items.get(field, ()))
+
+    def active(self, field: str) -> list[Candidate]:
+        """Return only candidates eligible for resolution."""
+        return [
+            candidate
+            for candidate in self._items.get(field, ())
+            if candidate.active
+        ]
+
+    def locked(self, field: str) -> list[Candidate]:
+        """Return active hard-locked candidates."""
+        return [
+            candidate
+            for candidate in self._items.get(field, ())
+            if candidate.active and candidate.locked
+        ]
+
+    def extracted(self, field: str) -> list[Candidate]:
+        """Return active directly extracted candidates."""
+        return [
+            candidate
+            for candidate in self._items.get(field, ())
+            if candidate.active
+            and candidate.kind == CandidateKind.EXTRACTED
+        ]
+
+    def derived(self, field: str) -> list[Candidate]:
+        """Return active derived candidates."""
+        return [
+            candidate
+            for candidate in self._items.get(field, ())
+            if candidate.active
+            and candidate.kind == CandidateKind.DERIVED
+        ]
+
+    def has_locked(self, field: str) -> bool:
+        return bool(self.locked(field))
+
+    def fields(self) -> set[str]:
+        return set(self._items)
+
+    def unresolved_fields(self) -> set[str]:
+        """
+        Kept for backwards compatibility.
+
+        NOTE:
+            This does NOT mean that these fields are actually unresolved
+            semantically. It means that the pool contains evidence for them
+            that still needs final resolution.
+        """
+        return self.fields()
+
+    def all(self) -> list[Candidate]:
+        """Return every candidate across every field."""
+        return [
+            candidate
+            for candidates in self._items.values()
+            for candidate in candidates
+        ]
+
+    def as_debug_dict(self) -> dict[str, list[dict[str, Any]]]:
+        """
+        Serialize the entire evidence pool.
+
+        Nothing is discarded: including rejected candidates.
+        """
+
+        return {
+            field_name: [
+                {
+                    "value": candidate.value,
+                    "source": candidate.source,
+                    "confidence": candidate.confidence,
+                    "kind": candidate.kind.value,
+                    "evidence": candidate.evidence,
+                    "rejected": candidate.rejected,
+                    "rejection_reason": candidate.rejection_reason,
+                }
+                for candidate in candidates
+            ]
+            for field_name, candidates in self._items.items()
+        }
+
+
+def _legacy_source(
+    data: dict,
+    field_name: str,
+    raw_field: str,
+) -> str:
+    sources = data.get("_field_sources") or {}
+
+    source_meta = sources.get(field_name)
+
+    if isinstance(source_meta, dict):
+        source = source_meta.get("source")
+        if source:
+            return str(source)
+
+    return str(
+        data.get(f"_src_{field_name}")
+        or data.get(f"_src_{raw_field}")
+        or data.get("metodo_extraccion")
+        or "legacy"
+    )
+
+
+def _legacy_lock(
+    locks: dict,
+    field_name: str,
+    raw_field: str,
+) -> dict[str, Any]:
+    """
+    Retrieve lock metadata without inventing a lock.
+
+    A value merely existing in _locked_fields is not enough unless
+    the metadata explicitly says locked=True.
+    """
+
+    lock = locks.get(raw_field)
+
+    if isinstance(lock, dict):
+        return lock
+
+    lock = locks.get(field_name)
+
+    if isinstance(lock, dict):
+        return lock
+
+    return {}
+
+
+def candidate_pool_from_legacy(data: dict) -> CandidatePool:
+    """
+    Convert the current legacy result into evidence.
+    This is a migration adapter only.
+    """
+    pool = CandidatePool()
+
+    locks = (
+        data.get("_locked_fields")
+        if isinstance(data.get("_locked_fields"), dict)
+        else {}
+    )
+
+    aliases = {
+        "total": ("total", "total_factura"),
+        "base_imponible": ("base_imponible", "base"),
+        "iva_importe": ("iva_importe", "iva"),
+        "irpf": ("importe_irpf", "irpf"),
+        "exento": ("exento",),
+        "fecha": ("fecha", "fecha_factura", "fecha_emision"),
+        "numero_factura": ("numero_factura", "numero", "referencia"),
+        "cif_vendedor": ("cif_vendedor", "cif", "cif_emisor", "nif", "nif_emisor"),
+        "cif_cliente": ("cif_cliente", "nif_cliente"),
+    }
+
+    for field_name, raw_fields in aliases.items():
+        seen: set[str] = set()
+
+        for raw_field in raw_fields:
+            value = data.get(raw_field)
+
+            if value is None or value == "":
+                continue
+
+            key = str(value).strip()
+            if key in seen:
+                continue
+            seen.add(key)
+
+            lock = _legacy_lock(locks, field_name, raw_field)
+
+            # 🔴 BISTURÍ 1: El candado solo se hereda si el valor coincide.
+            is_locked = False
+            if lock and lock.get("locked"):
+                val_candado = str(lock.get("value")).strip()
+                val_actual = str(value).strip()
+                
+                try:
+                    is_locked = float(val_candado) == float(val_actual)
+                except ValueError:
+                    is_locked = val_candado.lower() == val_actual.lower()
+                    
+                if not is_locked:
+                    lock = {}  # Limpiamos la metadata robada
+
+            source = lock.get("source") if is_locked else _legacy_source(data, field_name, raw_field)
+
+            # 👇 REEMPLAZA ESTE BLOQUE 👇
+            if is_locked:
+                kind = CandidateKind.LOCKED
+                confidence = 1.0
+            else:
+                # FIX: Si es un campo financiero y viene del legacy "structural_extractor"
+                # o "template_deterministic", le bajamos la confianza para que no compita
+                # injustamente con derivaciones matemáticas o OCR puro.
+                if field_name in ("total", "base_imponible", "iva_importe", "irpf") and \
+                   source in ("structural_extractor", "template_deterministic"):
+                    kind = CandidateKind.EXTRACTED
+                    confidence = 0.50
+                else:
+                    kind = CandidateKind.EXTRACTED
+                    confidence = 0.60
+
+            pool.propose(
+                field=field_name,
+                value=value,
+                source=source,
+                confidence=confidence,
+                kind=kind,
+                evidence={
+                    "legacy_field": raw_field,
+                    "legacy_adapter": True,
+                    "locked_metadata": lock or None,
+                },
+            )
+
+    # 🔴 BISTURÍ 2: Rescatar los candados huérfanos del Strong OCR
+    for locked_field, lock_meta in locks.items():
+        if not isinstance(lock_meta, dict):
+            continue
+            
+        val_candado = lock_meta.get("value")
+        if val_candado in (None, ""):
+            continue
+            
+        # Comprobamos si este candado ya logró entrar al pool
+        ya_propuesto = False
+        for c in pool.by_field(locked_field):
+            c_val_str = str(c.value).strip()
+            val_candado_str = str(val_candado).strip()
+            try:
+                if float(c_val_str) == float(val_candado_str):
+                    ya_propuesto = True
+                    break
+            except ValueError:
+                if c_val_str.lower() == val_candado_str.lower():
+                    ya_propuesto = True
+                    break
+                
+        # Si nadie lo metió, lo inyectamos a la fuerza con toda su autoridad
+        if not ya_propuesto:
+            pool.propose(
+                field=locked_field,
+                value=val_candado,
+                source=lock_meta.get("source", "strong_ocr_rescued"),
+                confidence=1.0,
+                kind=CandidateKind.LOCKED,
+                evidence={"locked_metadata": lock_meta, "rescued": True}
+            )
+            
+
+    return pool

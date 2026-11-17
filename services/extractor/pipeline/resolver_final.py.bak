@@ -1,0 +1,316 @@
+"""Final candidate resolver for invoice fields.
+
+This is intentionally small: it lets the legacy pipeline keep returning the
+same dict while moving authority decisions into one place.
+"""
+
+from __future__ import annotations
+import re
+
+
+from decimal import Decimal, InvalidOperation
+from typing import Any
+
+from .candidates import Candidate, CandidateKind, CandidatePool, candidate_pool_from_legacy
+
+_MONEY_TOLERANCE = Decimal("0.05")
+
+
+def _money(value: Any) -> Decimal:
+    if value is None or value == "":
+        return Decimal("0")
+    if isinstance(value, (int, float, Decimal)):
+        try:
+            return Decimal(str(value)).quantize(Decimal("0.01"))
+        except Exception:
+            return Decimal("0")
+            
+    s = str(value).strip()
+    # Limpiar cualquier símbolo de moneda, espacios o caracteres raros de OCR
+    s = re.sub(r'[^\d.,\-]', '', s)
+    if not s:
+        return Decimal("0")
+        
+    try:
+        # Si tiene ambos separadores, el último define cuál es el decimal
+        if ',' in s and '.' in s:
+            if s.rfind(',') > s.rfind('.'):
+                # Formato europeo: 1.234,56 -> quitamos puntos de miles, cambiamos coma por punto
+                s = s.replace('.', '').replace(',', '.')
+            else:
+                # Formato anglosajón: 1,234.56 -> quitamos comas de miles
+                s = s.replace(',', '')
+        elif ',' in s:
+            # Solo tiene coma (ej: 1234,56 o 1,234 si es anglosajón sin puntos)
+            # En contexto hispano, la coma suele ser decimal a menos que tenga 3 decimales exactos
+            if s.count(',') == 1 and len(s.split(',')[1]) == 3:
+                s = s.replace(',', '') # Es un separador de miles (ej: 1,000)
+            else:
+                s = s.replace(',', '.') # Es decimal (ej: 123,45)
+        elif '.' in s:
+            # Solo tiene puntos. Si hay varios (ej: 1.000.000), son miles. 
+            if s.count('.') > 1:
+                s = s.replace('.', '')
+            elif len(s.split('.')[1]) != 2 and len(s.split('.')[0]) <= 3:
+                # Heurística para miles con un solo punto (ej: 1.000 sin decimales)
+                # Ojo: si es 1.5 (1.50), tiene 1 decimal. Lo tratamos como decimal.
+                pass
+                
+        return Decimal(s).quantize(Decimal("0.01"))
+    except (InvalidOperation, ValueError, TypeError):
+        return Decimal("0")
+
+
+def _same_money(a: Any, b: Any) -> bool:
+    return abs(_money(a) - _money(b)) <= _MONEY_TOLERANCE
+
+
+def _is_zero_money(value: Any) -> bool:
+    return abs(_money(value)) <= _MONEY_TOLERANCE
+
+
+def _best(candidates: list[Candidate]) -> Candidate | None:
+    valid = [c for c in candidates if not c.rejected]
+    if not valid:
+        return None
+
+    # 1. Si hay LOCKETS, gana el mejor LOCKED
+    lockeds = [c for c in valid if c.kind == CandidateKind.LOCKED]
+    if lockeds:
+        return max(lockeds, key=lambda c: c.confidence)
+
+    # 2. Si no hay LOCKETS, gana el mejor EXTRACTED
+    extracteds = [c for c in valid if c.kind == CandidateKind.EXTRACTED]
+    if extracteds:
+        return max(extracteds, key=lambda c: c.confidence)
+
+    # 3. Si no, gana el mejor DERIVED
+    return max(valid, key=lambda c: c.confidence)
+
+
+def _resolve_field(candidates: list[Candidate]) -> tuple[Candidate | None, bool]:
+    valid = [c for c in candidates if not c.rejected]
+    locked = [c for c in valid if c.kind == CandidateKind.LOCKED]
+    if locked:
+        return _best(locked), False
+
+    extracted = [c for c in valid if c.kind == CandidateKind.EXTRACTED]
+    derived = [c for c in valid if c.kind == CandidateKind.DERIVED]
+    best_extracted = _best(extracted)
+    best_derived = _best(derived)
+
+    if best_extracted and best_derived:
+        if _is_zero_money(best_extracted.value) and not _is_zero_money(best_derived.value):
+            return best_derived, False
+        if _same_money(best_extracted.value, best_derived.value):
+            reinforced = Candidate(
+                field=best_extracted.field,
+                value=best_extracted.value,
+                source=f"{best_extracted.source}+{best_derived.source}",
+                confidence=min(1.0, max(best_extracted.confidence, best_derived.confidence) + 0.05),
+                kind=CandidateKind.EXTRACTED,
+                evidence={"reinforced_by": best_derived.source},
+            )
+            return reinforced, False
+        return best_extracted, True
+
+    if best_extracted:
+        return best_extracted, False
+    return best_derived, False
+
+
+def add_financial_derivations(pool: CandidatePool) -> dict[str, Any]:
+    total_cand = _best(pool.by_field("total"))
+    iva_cand = _best(pool.by_field("iva_importe"))
+    base_cand = _best(pool.by_field("base_imponible"))
+    irpf_cand = _best(pool.by_field("irpf"))
+
+    # Helpers para saber si el campo ya está blindado por OCR
+    is_locked = lambda field: any(c.kind.value == "locked" for c in pool.by_field(field))
+
+    t = _money(total_cand.value if total_cand else 0)
+    v = _money(iva_cand.value if iva_cand else 0)
+    b = _money(base_cand.value if base_cand else 0)
+    i = abs(_money(irpf_cand.value if irpf_cand else 0))
+
+    diagnostic: dict[str, Any] = {
+        "valid": False,
+        "derived": {},
+        "conflicts": [],
+        "equation": None,
+    }
+
+    # 1. DERIVAR BASE (Si tenemos Total y sabemos el IVA, aunque sea 0)
+    if not is_locked("base_imponible") and t > 0 and v >= 0 and t >= v:
+        derived_base = (t - v + i).quantize(Decimal("0.01"))
+        
+        # Toleramos IVA 0% (v=0), o tipos entre 1% y 35%
+        iva_rate = (v / derived_base) if derived_base > 0 else Decimal("0")
+        es_tipo_valido = (v == 0) or (Decimal("0.01") <= iva_rate <= Decimal("0.35"))
+        
+        if derived_base > 0 and es_tipo_valido:
+            # 🔴 Pasamos a str() para no corromper el Decimal a float
+            pool.propose(
+                "base_imponible",
+                str(derived_base),
+                source="financial_derivation",
+                confidence=0.9, # Las matemáticas son fuertes, pero un poco menos que la lectura cruda (1.0)
+                kind=CandidateKind.DERIVED,
+                evidence={"from": ["total", "iva_importe", "irpf"]},
+            )
+            diagnostic["derived"]["base_imponible"] = float(derived_base) # Solo para diagnostico interno
+            diagnostic["equation"] = f"{derived_base:.2f} + {v:.2f} - {i:.2f} = {t:.2f}"
+
+    # 2. DERIVAR IVA (Si tenemos Total y Base)
+    if not is_locked("iva_importe") and t > 0 and b > 0:
+        derived_iva = (t - b + i).quantize(Decimal("0.01"))
+        if derived_iva >= 0:
+            pool.propose(
+                "iva_importe",
+                str(derived_iva),
+                source="financial_derivation",
+                confidence=0.9,
+                kind=CandidateKind.DERIVED,
+                evidence={"from": ["total", "base_imponible", "irpf"]},
+            )
+            diagnostic["derived"]["iva_importe"] = float(derived_iva)
+
+    # 3. DERIVAR TOTAL (Si el total falta o no está bloqueado, pero tenemos Base e IVA)
+    if not is_locked("total") and b > 0 and v >= 0:
+        derived_total = (b + v - i).quantize(Decimal("0.01"))
+        if derived_total > 0:
+            pool.propose(
+                "total",
+                str(derived_total),
+                source="financial_derivation",
+                confidence=0.9,
+                kind=CandidateKind.DERIVED,
+                evidence={"from": ["base_imponible", "iva_importe", "irpf"]},
+            )
+            diagnostic["derived"]["total"] = float(derived_total)
+
+    # Evaluación Final de Conflictos y Validez
+    resolved_base, base_conflict = _resolve_field(pool.by_field("base_imponible"))
+    resolved_iva, iva_conflict = _resolve_field(pool.by_field("iva_importe"))
+    resolved_total, total_conflict = _resolve_field(pool.by_field("total"))
+    
+    if base_conflict: diagnostic["conflicts"].append("base_imponible")
+    if iva_conflict: diagnostic["conflicts"].append("iva_importe")
+    if total_conflict: diagnostic["conflicts"].append("total")
+
+    rb = _money(resolved_base.value if resolved_base else b)
+    rv = _money(resolved_iva.value if resolved_iva else v)
+    rt = _money(resolved_total.value if resolved_total else t)
+    
+    if rt > 0 and rb > 0:
+        # Validación final de la ecuación contable
+        diagnostic["valid"] = abs((rb + rv - i) - rt) <= _MONEY_TOLERANCE
+        if diagnostic["equation"] is None:
+            diagnostic["equation"] = f"{rb:.2f} + {rv:.2f} - {i:.2f} = {rt:.2f}"
+            
+    return diagnostic
+
+
+def resolve_candidate_pool(pool: CandidatePool) -> tuple[dict[str, Any], dict[str, Any]]:
+    result: dict[str, Any] = {}
+    diagnostics: dict[str, Any] = {"conflicts": {}}
+    for field_name in pool.unresolved_fields():
+        candidate, conflict = _resolve_field(pool.by_field(field_name))
+        if candidate:
+            result[field_name] = candidate.value
+        if conflict:
+            diagnostics["conflicts"][field_name] = [
+                {
+                    "value": c.value,
+                    "source": c.source,
+                    "kind": c.kind.value,
+                    "confidence": c.confidence,
+                }
+                for c in pool.by_field(field_name)
+                if not c.rejected
+            ]
+    return result, diagnostics
+
+
+def apply_resolved_identity(result: dict[str, Any], identity: dict[str, Any]) -> dict[str, Any]:
+    """Inyecta los ganadores de identidad en el diccionario de resultados."""
+    seller = identity.get("seller")
+    customer = identity.get("customer")
+
+    if seller:
+        # 🚦 AGENTE DE TRÁFICO PARA EL VENDEDOR 
+        if seller.get("type") in ["dni_es", "nie_es"]:
+            result["nif_emisor"] = seller["id"]  # Es persona/autónomo
+        else:
+            result["cif_vendedor"] = seller["id"] # Es empresa o VAT EU
+
+        if seller.get("name"):
+            result["nombre_vendedor"] = seller["name"]
+
+    if customer:
+        # 🚦 AGENTE DE TRÁFICO PARA EL CLIENTE
+        if customer.get("type") in ["dni_es", "nie_es"]:
+            result["nif_cliente"] = customer["id"] # Es persona
+        else:
+            result["cif_cliente"] = customer["id"] # Es empresa
+
+        if customer.get("name"):
+            result["nombre_cliente"] = customer["name"]
+
+    return result
+
+def resolve_legacy_invoice(data: dict, mark_conflicts: bool = True) -> dict[str, Any]:
+    """Orquestador principal que une el pool general, las finanzas y la identidad."""
+    from .identity_candidates import collect_identity_candidates, resolve_identity
+    
+    # 1. Creamos el Pool General
+    pool = candidate_pool_from_legacy(data)
+
+    # 2. Recogemos y resolvemos Identidad por separado
+    identity_candidates = collect_identity_candidates(data, text=data.get("ocr_text", ""))
+    identity = resolve_identity(identity_candidates)
+
+    # 3. Derivaciones y resolución del Pool General
+    financial = add_financial_derivations(pool)
+    resolved, diagnostics = resolve_candidate_pool(pool)
+    
+    print("DEBUG RESOLVED:", resolved)
+    print("DEBUG POOL BASE:", pool.as_debug_dict().get("base_imponible"))
+
+    # 4. Fusión de resultados (El Final Resolver acata lo que dice Identidad)
+    resolved = apply_resolved_identity(resolved, identity)
+
+    # 5. Guardamos las trazas para la autopsia
+    data["_candidate_pool"] = pool.as_debug_dict()
+    data["_financial_diagnostics"] = financial
+    data["_resolver_diagnostics"] = diagnostics
+    data["_identity_diagnostics"] = identity
+
+    # 6. Mapeo SEGURO y AUTORITATIVO al diccionario legacy
+    for field_name, value in resolved.items():
+        # Lo que decide el Resolver gana siempre, aplastando posibles errores del extractor
+        data[field_name] = value
+        
+        # Sincronizamos también los alias legacy para que el resto del sistema no se rompa
+        if field_name == "base_imponible":
+            data["base"] = value
+        elif field_name == "iva_importe":
+            data["iva"] = value
+        elif field_name == "total":
+            data["total_factura"] = value
+
+    # 7. Marcado de conflictos
+    if mark_conflicts and (diagnostics.get("conflicts") or financial.get("conflicts")):
+        data["math_inconsistencia"] = True
+        data["financial_structure_valid"] = False
+        data["_resolver_conflicts"] = True
+
+    return data
+
+
+__all__ = [
+    "add_financial_derivations",
+    "resolve_candidate_pool",
+    "resolve_legacy_invoice",
+    "apply_resolved_identity",
+]

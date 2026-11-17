@@ -1,0 +1,941 @@
+import html
+import streamlit as st
+import hashlib
+import pandas as pd
+import os
+import re
+import time
+import uuid
+from sqlalchemy import text
+from db.database import get_db, engine, actualizar_tipo_factura, TIPOS_FACTURA
+from core.tasks import procesar_factura_async
+from services.storage_service import subir_pdf_a_s3, generar_url_presigned
+from ui.utils import parse_fecha
+from core.logger import get_logger
+_log = get_logger("iatlas.ui.analisis")
+
+DEBUG = os.getenv("DEBUG_MODE", "false").lower() == "true"
+
+
+def render_mesa_trabajo():
+    """
+    Mesa de trabajo con UI de revisión inteligente.
+    - Confianza >= 85: expander colapsado, campos prefilled, 1 click para confirmar
+    - Confianza 50-84: expander abierto con alertas amarillas en campos dudosos
+    - Confianza < 50:  banner rojo, selector de proveedor, campos vacíos resaltados
+    """
+    # --- 1. CARGA DE DATOS ---
+    # --- 1. CARGA DE DATOS CORREGIDA ---
+    try:
+        with engine.connect() as connection:
+            df = pd.read_sql_query(
+                text("""
+                    SELECT id, emisor, cif_vendedor, cliente, cif_cliente, numero_factura,
+                        TO_CHAR(fecha, 'DD/MM/YYYY') AS fecha,
+                        base, iva, exento, importe_irpf, total, estado, nombre_s3,
+                        COALESCE(confianza, 0) as confianza,
+                        metodo_extraccion, tipo_factura
+                    FROM facturas
+                    WHERE empresa_id = :eid
+                    AND estado NOT IN ('completado', 'borrado', 'error')
+                    ORDER BY id DESC LIMIT 50  -- <--- CAMBIADO: ORDENAMOS POR ID, NO POR CONFIANZA
+                """),
+                connection,
+                params={"eid": st.session_state.empresa_id}
+            )
+        
+        if not df.empty:
+            df['cif_vendedor']  = df['cif_vendedor'].fillna('')
+            df['numero_factura'] = df['numero_factura'].fillna('S/N')
+            df['total']          = df['total'].fillna(0.0)
+            # Deduplicar por id de DB — clave real y única.
+            # key_unica (CIF+número+total) generaba falsos positivos cuando los tres
+            # valores eran vacíos/0, descartando filas legítimas pendientes de revisión.
+            df = df.drop_duplicates(subset=['id']).reset_index(drop=True)
+            
+    except Exception as e:
+        _log.error("Error cargando facturas de empresa %s: %s", st.session_state.get("empresa_id"), e, exc_info=True)
+        st.error("No se pudieron cargar las facturas. Inténtalo de nuevo.")
+        return
+
+    if df.empty:
+        st.info("No hay facturas pendientes de revisión.")
+        return
+
+    # --- 2. RESUMEN DEL LOTE ---
+    total_lote = df['total'].sum()
+    base_lote  = df['base'].sum()
+    iva_lote   = df['iva'].sum()
+    irpf_lote  = df['importe_irpf'].sum()
+
+    st.markdown("### 📋 Resumen del Lote Actual")
+
+    # --- TABLA RESUMEN RÁPIDA ---
+    # Seleccionamos las columnas usando los nombres reales de la DB (Error Nº2 corregido)
+    df_resumen = df[["emisor", "cliente", "numero_factura", "base", "iva", "importe_irpf", "total"]].copy()
+    
+    # Renombramos solo para la visualización estética del usuario
+    df_resumen.columns = ["Emisor", "Cliente", "Nº Factura", "Base", "IVA", "IRPF", "Total"]
+    
+    # Mostramos la tabla limpia
+    st.dataframe(df_resumen, width='stretch', hide_index=True)
+
+    # Totales del lote
+    rc1, rc2, rc3, rc4, rc5 = st.columns(5)
+    rc1.markdown(f"**Base**\n\n### {base_lote:.2f} €")
+    rc2.markdown(f"**IVA**\n\n### {iva_lote:.2f} €")
+    rc3.markdown(f"**Exento**\n\n### 0.00 €")
+    rc4.markdown(f"**IRPF**\n\n### {irpf_lote:.2f} €")
+    rc5.markdown(f"**TOTAL**\n\n### {total_lote:.2f} €")
+
+    # Botón guardar todas
+    if st.button("GUARDAR TODAS LAS FACTURAS", type="primary", width='stretch'):
+        try:
+            correcciones_alias  = []
+            datos_para_reglas   = []
+            with engine.begin() as conn:
+                for _, row in df.iterrows():
+                    fid      = row['id']
+                    e_final  = st.session_state.get(f"e_{fid}",  row.get('emisor')       or "")
+                    cv_final = st.session_state.get(f"ne_{fid}", row.get('cif_vendedor') or "")
+                    nf_final = st.session_state.get(f"nu_{fid}", row.get('numero_factura') or "")
+                    fe_final = st.session_state.get(f"fe_{fid}", row.get('fecha')          or "")
+                    ba_final = float(st.session_state.get(f"ba_{fid}", row.get('base')         or 0))
+                    iv_final = float(st.session_state.get(f"iv_{fid}", row.get('iva')          or 0))
+                    ex_final = float(st.session_state.get(f"ex_{fid}", row.get('exento')       or 0))
+                    tt_final = float(st.session_state.get(f"tt_{fid}", row.get('total')        or 0))
+                    conn.execute(text("""
+                        UPDATE facturas SET
+                            emisor=:e, cif_vendedor=:cv, cliente=:c, cif_cliente=:cc,
+                            numero_factura=:nf, fecha=:f, base=:b, iva=:iv,
+                            exento=:ex, importe_irpf=:ir, total=:tt, estado='completado'
+                        WHERE id=:id
+                    """), {
+                        "e":  e_final,
+                        "cv": cv_final,
+                        "c":  st.session_state.get(f"c_{fid}",  row.get('cliente')        or ""),
+                        "cc": st.session_state.get(f"nc_{fid}", row.get('cif_cliente')    or ""),
+                        "nf": nf_final,
+                        "f":  parse_fecha(fe_final),
+                        "b":  ba_final,
+                        "iv": iv_final,
+                        "ex": ex_final,
+                        "ir": float(st.session_state.get(f"ir_{fid}", row.get('importe_irpf') or 0)),
+                        "tt": tt_final,
+                        "id": fid,
+                    })
+                    # Recoger correcciones de alias
+                    e_orig = str(row.get('emisor') or "").strip()
+                    if str(e_final).strip() and str(e_final).strip() != e_orig:
+                        correcciones_alias.append((e_orig, str(e_final).strip(), str(cv_final).strip()))
+                    # Recoger datos para detección de reglas
+                    if str(cv_final).strip():
+                        datos_para_reglas.append({
+                            "cif": str(cv_final).strip(),
+                            "original": {
+                                "fecha":          str(row.get("fecha")          or ""),
+                                "base":           float(row.get("base")          or 0),
+                                "iva":            float(row.get("iva")           or 0),
+                                "exento":         float(row.get("exento")        or 0),
+                                "total":          float(row.get("total")         or 0),
+                                "numero_factura": str(row.get("numero_factura")  or ""),
+                            },
+                            "corregido": {
+                                "fecha":          fe_final,
+                                "base":           ba_final,
+                                "iva":            iv_final,
+                                "exento":         ex_final,
+                                "total":          tt_final,
+                                "numero_factura": nf_final,
+                            },
+                        })
+
+            # Post-commit: alias
+            if correcciones_alias:
+                try:
+                    from learning.alias import guardar_alias
+                    for alias_raw, alias_canon, cif in correcciones_alias:
+                        guardar_alias(alias_raw, alias_canon, cif, st.session_state.empresa_id)
+                except Exception:
+                    _log.debug("guardar_alias post-commit falló", exc_info=True)
+
+            # Post-commit: reglas de cálculo / prefijo / fecha
+            if datos_para_reglas:
+                try:
+                    from learning.rules import detectar_y_guardar_reglas
+                    for item in datos_para_reglas:
+                        detectar_y_guardar_reglas(
+                            item["cif"], st.session_state.empresa_id,
+                            item["original"], item["corregido"],
+                        )
+                except Exception:
+                    _log.debug("detectar_y_guardar_reglas post-commit falló", exc_info=True)
+
+            st.success("Todas las facturas guardadas correctamente.")
+            time.sleep(1)
+            st.rerun()
+        except Exception as e:
+            _log.error("Error guardando lote empresa %s: %s", st.session_state.get("empresa_id"), e, exc_info=True)
+            st.error("No se pudieron guardar los cambios. Inténtalo de nuevo.")
+
+    st.divider()
+
+    # --- 3. CONTROLES DE MESA ---
+    col_t, col_ref, col_vac = st.columns([3, 1, 1])
+    col_t.subheader("🔎 Edición de Documentos")
+    if col_ref.button("Refrescar", width='stretch'):
+        st.rerun()
+    if col_vac.button("Limpiar Mesa", width='stretch'):
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "DELETE FROM facturas WHERE empresa_id=:eid AND estado NOT IN ('completado','borrado')"
+                ), {"eid": st.session_state.empresa_id})
+            st.session_state.procesados = set()
+            st.cache_data.clear()
+            st.rerun()
+        except Exception as e:
+            _log.error("Error limpiando mesa empresa %s: %s", st.session_state.get("empresa_id"), e, exc_info=True)
+            st.error("No se pudo limpiar la mesa. Inténtalo de nuevo.")
+
+    st.divider()
+
+    # Proveedores conocidos para el selector
+    _PROVEEDORES_CONOCIDOS = {
+        "Vodafone España, S.A.U.":                               "B87539284",
+        "Xfera Móviles, S.A. (Yoigo)":                          "A82528548",
+        "O2 Spain, S.L.U.":                                      "B87328001",
+        "Repsol Comercializadora de Electricidad y Gas, S.L.U.": "B39540760",
+        "Naturgy Clientes, S.A.U.":                              "A67760876",
+        "Octopus Energy España, S.L.U.":                         "B40563082",
+        "EMASESA (Empresa Municipal de Aguas)":                  "28829809E",
+        "Amazon EU S.à r.l.":                                    "LU20260743",
+        "Apple Distribution International Ltd.":                 "IE9700053D",
+        "OVH Hispano, S.L.":                                     "B83834747",
+        "OpenAI Ireland Limited":                                 "IE4143435AH",
+        "Canva Pty. Ltd.":                                       "EU372042198",
+        "Google Ireland Ltd":                                    "IE3668997OH",
+        "Idealista, S.A.U.":                                     "A82505660",
+        "Adevinta Spain, S.L. (Fotocasa)":                       "B70677125",
+        "Gestoría Garcés (Aurora Garcés Balanza)":               "27290749F",
+        "Schmidt Dos Hermanas, S.L.":                            "B91937912",
+        "Otro / No listado":                                     "",
+    }
+
+    # --- 4. TARJETAS DE REVISIÓN ---
+    for _, row in df.iterrows():
+        fid       = int(row['id'])
+        estado    = row['estado']
+        confianza = int(row.get('confianza') or 0)
+        emisor    = str(row.get('emisor') or "")
+        metodo    = str(row.get('metodo_extraccion') or "")
+        url_pdf = generar_url_presigned(
+            row.get("nombre_s3"), st.session_state.empresa_id
+        ) if row.get("nombre_s3") else None
+
+        # Detectar campos problemáticos
+        campos_vacios = []
+        if not str(row.get('cif_vendedor') or "").strip():
+            campos_vacios.append("CIF Emisor")
+        if not str(row.get('emisor') or "").strip() or "sin identificar" in emisor.lower():
+            campos_vacios.append("Nombre Emisor")
+        if not str(row.get('numero_factura') or "").strip():
+            campos_vacios.append("Nº Factura")
+        if not str(row.get('fecha') or "").strip() or row.get('fecha') == "01/01/2026":
+            campos_vacios.append("Fecha")
+        if float(row.get('total') or 0) == 0:
+            campos_vacios.append("Total")
+
+        # Semáforo y color de borde
+        if confianza >= 85:
+            color_borde = "#2d6a4f"
+            icono_conf  = f"🟢 {confianza}%"
+            expandido   = False
+        elif confianza >= 50:
+            color_borde = "#b5840a"
+            icono_conf  = f"🟡 {confianza}%"
+            expandido   = True
+        else:
+            color_borde = "#9b2335"
+            icono_conf  = f"🔴 {confianza}%"
+            expandido   = True
+
+        with st.container(border=True):
+            # Cabecera de tarjeta
+            col_info, col_conf, col_link, col_re = st.columns([4, 1, 1, 1])
+            col_info.markdown(f"📄 **Emisor:** {emisor or 'Desconocido'}")
+            col_conf.markdown(f"**{icono_conf}**")
+
+            if url_pdf:
+                col_link.link_button("📂 Ver PDF", url_pdf, width='stretch')
+
+            if row.get('nombre_s3') and col_re.button("🔄 Reanalizar", key=f"re_{fid}", width='stretch'):
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(text(
+                            "UPDATE facturas SET estado='analizando', emisor='Reanalizando...' WHERE id=:id"
+                        ), {"id": fid})
+                    procesar_factura_async.delay(row['nombre_s3'], st.session_state.empresa_id, factura_id=fid)
+                    st.success(f"Factura #{fid} enviada a reanalizar.")
+                    time.sleep(1)
+                    st.rerun()
+                except Exception as e:
+                    _log.error("Error lanzando reanalisis factura %s: %s", fid, e, exc_info=True)
+                    st.error("No se pudo lanzar el reanálisis. Inténtalo de nuevo.")
+
+            if estado in ['procesando', 'analizando']:
+                st.info("El motor ATLAS está trabajando... refresca en unos segundos.")
+                continue
+
+            # Banner de alerta si confianza baja
+            if confianza < 50 and campos_vacios:
+                st.warning(
+                    f"⚠️ **Revisión necesaria** — Campos sin datos: {', '.join(campos_vacios)}. "
+                    f"Selecciona el proveedor o completa manualmente."
+                )
+            elif confianza < 85 and campos_vacios:
+                st.info(f"Campos a revisar: **{', '.join(campos_vacios)}**")
+
+            # Selector de proveedor rápido si confianza < 70 o CIF vacío
+            if confianza < 70 or not str(row.get('cif_vendedor') or "").strip():
+                opciones_prov = ["— Seleccionar proveedor conocido —"] + list(_PROVEEDORES_CONOCIDOS.keys())
+                sel = st.selectbox(
+                    "¿Reconoces este proveedor?",
+                    opciones_prov,
+                    key=f"prov_sel_{fid}",
+                    label_visibility="visible"
+                )
+                if sel and sel != "— Seleccionar proveedor conocido —":
+                    cif_sel = _PROVEEDORES_CONOCIDOS[sel]
+                    # Prellenar session_state con los datos del proveedor seleccionado
+                    if sel != "Otro / No listado":
+                        st.session_state[f"e_{fid}"]  = sel
+                        st.session_state[f"ne_{fid}"] = cif_sel
+                        st.caption(f"Proveedor seleccionado: **{sel}** · CIF: `{cif_sel}`")
+
+            # FIX: siempre abierto — si hay 180 facturas no pueden ir una a una
+            with st.expander(f"Revisar Datos - Factura #{fid}", expanded=True):
+                c1, c2, c3 = st.columns(3)
+
+                # Resaltar campos vacíos con placeholder visible
+                emi_nom  = c1.text_input(
+                    "Nombre Emisor" + (" ⚠️" if "Nombre Emisor" in campos_vacios else ""),
+                    value=st.session_state.get(f"e_{fid}",  emisor),
+                    key=f"e_{fid}"
+                )
+                cli_nom  = c2.text_input("Nombre Cliente",
+                    value=str(row.get('cliente') or ""), key=f"c_{fid}")
+                num_fact = c3.text_input(
+                    "Nº Factura / Ref" + (" ⚠️" if "Nº Factura" in campos_vacios else ""),
+                    value=str(row.get('numero_factura') or ""), key=f"nu_{fid}"
+                )
+
+                c4, c5, c6 = st.columns(3)
+                emi_nif = c4.text_input(
+                    "CIF Emisor" + (" ⚠️" if "CIF Emisor" in campos_vacios else ""),
+                    value=st.session_state.get(f"ne_{fid}", str(row.get('cif_vendedor') or "")),
+                    key=f"ne_{fid}"
+                )
+                cli_nif = c5.text_input("CIF Cliente",
+                    value=str(row.get('cif_cliente') or ""), key=f"nc_{fid}")
+                fecha_f = c6.text_input(
+                    "Fecha" + (" ⚠️" if "Fecha" in campos_vacios else ""),
+                    value=str(row.get('fecha') or ""), key=f"fe_{fid}"
+                )
+
+                # ── Tipo de factura (editable, independiente del resto) ───
+                # La clasificación del extractor es solo un punto de partida:
+                # el usuario puede recategorizar a mano (Endesa → Energía,
+                # ticket diesel mal etiquetado → Gasolina/Combustible…).
+                # Guardar aquí NO reanaliza la factura ni toca importes/NIFs.
+                tipo_actual = row.get("tipo_factura") or "Estándar"
+                _idx_tipo = (
+                    list(TIPOS_FACTURA).index(tipo_actual)
+                    if tipo_actual in TIPOS_FACTURA else 0
+                )
+                t_sel_col, t_btn_col = st.columns([4, 1])
+                tipo_nuevo = t_sel_col.selectbox(
+                    "Tipo de Factura",
+                    list(TIPOS_FACTURA),
+                    index=_idx_tipo,
+                    key=f"tipo_{fid}",
+                    help="Reclasifica esta factura si el sistema acertó mal. "
+                         "Solo se actualiza este campo en BD — no se reanaliza el documento.",
+                )
+                if t_btn_col.button("Guardar tipo", key=f"sv_tipo_{fid}", width="stretch"):
+                    ok, msg = actualizar_tipo_factura(
+                        fid, st.session_state.empresa_id, tipo_nuevo
+                    )
+                    if ok:
+                        st.toast(f"Tipo actualizado a «{tipo_nuevo}»", icon="🏷️")
+                    else:
+                        st.error(f"No se pudo actualizar el tipo: {msg}")
+
+            st.markdown("##### 💰 Desglose Económico")
+            c7, c8, c9, c10, c11 = st.columns(5)
+
+            # Forzamos float y 0.0 por defecto para evitar errores de widgets vacíos
+            base    = c7.number_input("Base",   value=float(row.get('base') or 0.0), format="%.2f", key=f"ba_{fid}")
+            iva     = c8.number_input("IVA",    value=float(row.get('iva') or 0.0), format="%.2f", key=f"iv_{fid}")
+            exento  = c9.number_input("Exento", value=float(row.get('exento') or 0.0), format="%.2f", key=f"ex_{fid}")
+            irpf    = c10.number_input("IRPF",  value=float(row.get('importe_irpf') or 0.0), format="%.2f", key=f"ir_{fid}")
+
+            # Aquí es donde faltaba cerrar y completar:
+            total   = c11.number_input(
+                "TOTAL" + (" ⚠️" if "Total" in campos_vacios else ""), 
+                value=float(row.get('total') or 0.0),
+                format="%.2f",
+                key=f"tt_{fid}"
+            )
+
+            # Panel de auditoría técnica (solo admin)
+            if st.session_state.get("rol") == "admin" and row.get("nombre_s3"):
+                with st.expander("🔍 Inspección Técnica", expanded=False):
+                    try:
+                        from services.trace_service import load_trace
+                        traza = load_trace(row["nombre_s3"])
+                    except Exception:
+                        traza = None
+                    if not traza:
+                        st.caption("Sin datos de traza para esta factura. Procesa de nuevo para generarlos.")
+                    else:
+                        st.caption(f"Última actualización: {traza.get('updated_at', '')}")
+                        t_ocr, t_regex, t_ia, t_struct = st.tabs(
+                            ["OCR", "Regex", "IA Calls", "Zonas"]
+                        )
+                        with t_ocr:
+                            # CORRECCIÓN: Añadimos key única basada en el fid (ID de factura)
+                            st.text_area(
+                                "Texto OCR extraído", 
+                                value=traza.get("ocr_texto", ""),
+                                height=300, 
+                                disabled=True, 
+                                label_visibility="collapsed",
+                                key=f"ocr_area_{fid}"  # <--- ID ÚNICO Y DINÁMICO
+                            )
+                        with t_regex:
+                            # También ponemos key única aquí por seguridad, 
+                            # aunque el dataframe suele ser más tolerante
+                            regex_campos = traza.get("regex_campos") or {}
+                            if regex_campos:
+                                st.dataframe(
+                                    [{"Campo": k, "Valor": v} for k, v in regex_campos.items()],
+                                    hide_index=True, use_container_width=True,
+                                    key=f"df_regex_{fid}" 
+                                )
+                            else:
+                                st.caption("Ningún campo extraído por regex.")
+                        with t_ia:
+                            ia_calls = traza.get("ia_calls") or []
+                            if not ia_calls:
+                                st.caption("Sin llamadas IA registradas (extracción por regex puro).")
+                            for _ci, call in enumerate(ia_calls):
+                                st.markdown(f"**Nivel:** `{call.get('nivel', '')}` · Completó: {call.get('completados', [])}")
+                                col_p, col_r = st.columns(2)
+                                col_p.text_area("Prompt", value=call.get("prompt", ""),
+                                                height=200, disabled=True, key=f"prompt_{fid}_{call.get('nivel')}_{_ci}")
+                                col_r.text_area("Respuesta raw", value=call.get("raw", ""),
+                                                height=200, disabled=True, key=f"raw_{fid}_{call.get('nivel')}_{_ci}")
+                        with t_struct:
+                            structural = traza.get("structural") or {}
+                            if not structural:
+                                st.caption("Sin datos de OCR estructural.")
+                            else:
+                                for zone_name, words in structural.items():
+                                    if words:
+                                        texts = " · ".join(w.get("text", "") for w in words[:10])
+                                        st.markdown(f"**{zone_name}:** {texts}")
+
+            # --- VALIDACIÓN MATEMÁTICA ---
+            # La fórmula: Base + IVA + Exento + IRPF (siendo IRPF negativo)
+            esperado = round(base + iva + exento + irpf, 2)
+
+            if total > 0 and abs(esperado - total) > 0.05:
+                st.warning(
+                    f"⚠️ **Los números no cuadran:** Suma calculada {esperado:.2f}€ "
+                    f"≠ Total factura {total:.2f}€"
+                )
+
+                # --- VALIDACIÓN MATEMÁTICA ---
+                # La fórmula: Base + IVA + Exento + IRPF (siendo IRPF negativo)
+                esperado = round(base + iva + exento + irpf, 2)
+
+                if total > 0 and abs(esperado - total) > 0.05:
+                    st.warning(
+                        f"⚠️ **Los números no cuadran:** Suma calculada {esperado:.2f}€ "
+                        f"≠ Total factura {total:.2f}€"
+                )
+                # Método usado (info para el usuario)
+                if metodo:
+                    metodo_label = {
+                        "parser_ovh": "🏎️ Parser OVH",
+                        "parser_idealista": "🏎️ Parser Idealista",
+                        "parser_amazon": "🏎️ Parser Amazon",
+                        "parser_vodafone": "🏎️ Parser Vodafone",
+                        "parser_octopus": "🏎️ Parser Octopus",
+                        "parser_gestoria_garces": "🏎️ Parser Gestoría Garcés",
+                        "regex_pro": "⚡ Regex",
+                    }.get(metodo, f"IA ({metodo})")
+                    st.caption(f"Método: {metodo_label}")
+
+                if st.button(f"Confirmar y Guardar #{fid}", key=f"sv_{fid}",
+                             width='stretch', type="primary"):
+                    from services.manual_review_service import guardar_revision_manual
+                    resultado = guardar_revision_manual(
+                        factura_id=fid,
+                        cambios={
+                            "emisor":         emi_nom,
+                            "cif_vendedor":   emi_nif,
+                            "cliente":        cli_nom,
+                            "cif_cliente":    cli_nif,
+                            "numero_factura": num_fact,
+                            "fecha":          fecha_f,
+                            "base":           base,
+                            "iva":            iva,
+                            "exento":         exento,
+                            "importe_irpf":   irpf,
+                            "total":          total,
+                        },
+                        usuario_id=st.session_state.get("usuario_id"),
+                    )
+                    if resultado["ok"]:
+                        for desc in resultado.get("reglas_aprendidas") or []:
+                            st.toast(f"Regla aprendida: {desc}", icon="🧠")
+                        st.rerun()
+                    else:
+                        _log.error("Error guardando factura %s: %s", fid, resultado.get("error"))
+                        st.error(f"No se pudo guardar la factura #{fid}. Inténtalo de nuevo.")
+
+
+# ---------------------------------------------------------------------------
+# LOADER ANIMADO
+# ---------------------------------------------------------------------------
+
+_LOADER_CSS = """
+<style>
+@keyframes atlas-pulse {
+    0%,100% { opacity:.3; transform: scaleY(.6); }
+    50%      { opacity:1;  transform: scaleY(1.2); }
+}
+.atlas-loader {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 32px 0 24px;
+    gap: 18px;
+}
+.atlas-bars {
+    display: flex;
+    gap: 6px;
+    align-items: flex-end;
+    height: 40px;
+}
+.atlas-bar {
+    width: 8px;
+    border-radius: 4px;
+    background: #64301f;
+    animation: atlas-pulse 1.1s ease-in-out infinite;
+}
+.atlas-bar:nth-child(2) { animation-delay:.15s; background:#8B4513; }
+.atlas-bar:nth-child(3) { animation-delay:.30s; background:#A0522D; }
+.atlas-bar:nth-child(4) { animation-delay:.45s; background:#CD853F; }
+.atlas-bar:nth-child(5) { animation-delay:.60s; background:#D4956A; }
+.atlas-step {
+    font-size: 0.95rem;
+    color: #64301f;
+    font-weight: 600;
+    font-family: Georgia, serif;
+    letter-spacing: 0.02em;
+}
+.atlas-substep {
+    font-size: 0.78rem;
+    color: #8C7B75;
+    margin-top: -10px;
+}
+</style>
+"""
+
+_PASOS_LOADER = [
+    ("📤 Subiendo archivo a la nube...",   "Conectando con almacenamiento seguro"),
+    ("🔍 Analizando estructura del PDF...", "Detectando tipo de documento"),
+    ("🧠 Extrayendo datos con IA...",       "Motor ATLAS procesando"),
+    ("✅ Validando importes...",             "Comprobando coherencia fiscal"),
+    ("💾 Guardando en tu historial...",     "Actualizando base de datos"),
+]
+
+
+def _mostrar_loader(archivo_nombre: str):
+    """Muestra loader animado con pasos mientras se procesa."""
+    # Escapar el nombre de archivo (user-controlled) para evitar XSS en HTML
+    safe_nombre = html.escape(archivo_nombre)
+    st.markdown(_LOADER_CSS, unsafe_allow_html=True)
+    placeholder = st.empty()
+
+    for paso, substep in _PASOS_LOADER:
+        placeholder.markdown(f"""
+        <div class="atlas-loader">
+            <div class="atlas-bars">
+                <div class="atlas-bar" style="height:20px"></div>
+                <div class="atlas-bar" style="height:32px"></div>
+                <div class="atlas-bar" style="height:40px"></div>
+                <div class="atlas-bar" style="height:28px"></div>
+                <div class="atlas-bar" style="height:16px"></div>
+            </div>
+            <div class="atlas-step">{paso}</div>
+            <div class="atlas-substep">{safe_nombre} · {substep}</div>
+        </div>
+        """, unsafe_allow_html=True)
+        time.sleep(0.6)
+
+    placeholder.empty()
+
+
+def analisis_view():
+    if "empresa_id" not in st.session_state or not st.session_state.empresa_id:
+        st.session_state.empresa_id = 1
+
+    if "procesados" not in st.session_state:
+        st.session_state.procesados = set()
+
+    if "enviando" not in st.session_state:
+        st.session_state.enviando = False
+
+    # FIX: key dinámico para resetear el file_uploader sin romper sesión
+    if "uploader_key" not in st.session_state:
+        st.session_state.uploader_key = 0
+
+    if "tareas_en_vuelo" not in st.session_state:
+        st.session_state.tareas_en_vuelo = 0
+
+    if "facturas_antes" not in st.session_state:
+        st.session_state.facturas_antes = 0
+
+    if "poll_inicio" not in st.session_state:
+        st.session_state.poll_inicio = 0.0
+
+    # ── Notificaciones del worker (éxito / duplicado / error) ──────────────
+    # Se comprueban en cada rerender, incluyendo los del polling automático.
+    # Así el usuario recibe feedback en cuanto el worker termina (~3 s).
+    try:
+        from core.notificaciones import get_pendientes, marcar_leidas
+        _notifs = get_pendientes(st.session_state.empresa_id)
+        if _notifs:
+            _iconos = {"success": "✅", "duplicado": "🔁", "error": "❌", "limite": "⚠️"}
+            for _n in _notifs:
+                st.toast(_n["mensaje"], icon=_iconos.get(_n["tipo"], "ℹ️"))
+            marcar_leidas(st.session_state.empresa_id)
+            # Parar el polling si estaba activo — el render actual ya continúa
+            # hacia render_mesa_trabajo() sin necesidad de un rerun extra.
+            # IMPORTANTE: NO llamar st.rerun() aquí.
+            # st.toast() funciona sin rerun (es un overlay inmediato).
+            # Un rerun aquí crea un bucle si marcar_leidas() falla en DB:
+            # notificaciones quedan sin marcar → siguiente render las vuelve a leer
+            # → otro rerun → render_mesa_trabajo() nunca se renderiza.
+            if st.session_state.get("tareas_en_vuelo", 0) > 0:
+                st.session_state.tareas_en_vuelo = 0
+    except Exception:
+        _log.debug("bloque notificaciones falló", exc_info=True)
+
+    # ── Verificación de límite de plan ─────────────────────────────────────
+    try:
+        from core.planes import verificar_limite, get_plan_empresa
+        _puede, _msg_limite = verificar_limite(st.session_state.empresa_id)
+        _plan_actual = get_plan_empresa(st.session_state.empresa_id)
+        _es_trial    = _plan_actual.get("es_trial", False)
+        _disponibles = _plan_actual.get("disponibles", 999)
+    except Exception:
+        _puede = True
+        _msg_limite = ""
+        _es_trial = False
+        _disponibles = 999
+
+    # Trial agotado → paywall, sin uploader
+    if not _puede:
+        st.markdown("""
+<div style="
+    background:linear-gradient(135deg,#FFF8F5,#F5EDE6);
+    border:2px solid #64301f;border-radius:12px;
+    padding:32px;text-align:center;margin:16px 0 24px
+">
+    <div style="font-size:2.8rem;margin-bottom:10px">🎁</div>
+    <h2 style="color:#64301f;margin:0 0 8px">Has completado tu prueba gratuita</h2>
+    <p style="color:#8C7B75;font-size:1rem;margin:0 0 24px">
+        Has analizado las 5 facturas de prueba. Para seguir automatizando tu contabilidad,
+        activa uno de los planes de I.Atlas.
+    </p>
+    <div style="display:flex;justify-content:center;gap:16px;flex-wrap:wrap;margin-bottom:8px">
+        <div style="background:white;border-radius:8px;padding:14px 22px;
+                    border:1px solid #e8e0d8;min-width:130px">
+            <strong style="color:#64301f">📦 Starter</strong><br>
+            <span style="font-size:1.3rem;font-weight:bold;color:#333">49€/mes</span><br>
+            <span style="color:#8C7B75;font-size:0.82rem">300 facturas/mes</span>
+        </div>
+        <div style="background:#64301f;border-radius:8px;padding:14px 22px;min-width:130px">
+            <strong style="color:white">⭐ Pro</strong><br>
+            <span style="font-size:1.3rem;font-weight:bold;color:white">149€/mes</span><br>
+            <span style="color:rgba(255,255,255,.75);font-size:0.82rem">2.000 facturas/mes</span>
+        </div>
+        <div style="background:white;border-radius:8px;padding:14px 22px;
+                    border:1px solid #e8e0d8;min-width:130px">
+            <strong style="color:#2d4a3e">🏢 Business</strong><br>
+            <span style="font-size:1.3rem;font-weight:bold;color:#333">399€/mes</span><br>
+            <span style="color:#8C7B75;font-size:0.82rem">Sin límite</span>
+        </div>
+    </div>
+</div>
+        """, unsafe_allow_html=True)
+
+        if st.button("Ver todos los planes y activar suscripción",
+                     type="primary", width='stretch'):
+            st.session_state["_ir_a_suscripcion"] = True
+            st.rerun()
+
+        st.divider()
+        st.caption("Tus facturas procesadas durante la prueba siguen disponibles aquí:")
+        render_mesa_trabajo()
+        return
+
+    # Trial activo con pocas facturas restantes → banner de aviso
+    if _es_trial and _disponibles <= 2:
+        restantes = _disponibles
+        st.warning(
+            f"Te {'queda' if restantes == 1 else 'quedan'} **{restantes} factura"
+            f"{'s' if restantes != 1 else ''}** de prueba gratuita"
+            f"{'s' if restantes != 1 else ''}. "
+            f"[Activa un plan](#) para no interrumpir tu trabajo.",
+            icon="🎁",
+        )
+
+    if DEBUG:
+        st.info(f"Empresa ID: {st.session_state.get('empresa_id')}")
+
+    # Límite de archivos por tanda según plan
+    _plan_key = _plan_actual.get("plan", "") if "_plan_actual" in dir() else ""
+    _MAX_ARCHIVOS_TANDA = 10 if _plan_key in ("trial", "starter") else 20
+
+    subidos = st.file_uploader(
+        "Arrastra tus facturas aquí",
+        accept_multiple_files=True,
+        type=["pdf"],
+        key=f"uploader_{st.session_state.uploader_key}",
+        help=f"Puedes subir varios PDFs a la vez. Máximo {_MAX_ARCHIVOS_TANDA} por tanda con tu plan actual.",
+    )
+
+    # Aviso y bloqueo si se supera el límite de tanda
+    _limite_superado = subidos and len(subidos) > _MAX_ARCHIVOS_TANDA
+    if _limite_superado:
+        st.warning(
+            f"⚠️ Para garantizar la máxima velocidad, procesamos un máximo de "
+            f"**{_MAX_ARCHIVOS_TANDA} facturas por tanda** con tu plan actual. "
+            f"Has seleccionado **{len(subidos)}**. "
+            f"Por favor, sube el resto en el siguiente bloque."
+        )
+
+    if subidos:
+        nuevos_con_hash = []
+        for f in subidos:
+            file_hash = hashlib.md5(f.getvalue()).hexdigest()
+            if file_hash not in st.session_state.procesados:
+                nuevos_con_hash.append((f, file_hash))
+
+        if nuevos_con_hash:
+            if st.button(
+                f"Procesar {len(nuevos_con_hash)} {'factura' if len(nuevos_con_hash)==1 else 'facturas'}",
+                disabled=st.session_state.enviando or _limite_superado,
+                type="primary",
+                width='stretch',
+            ):
+                st.session_state.enviando = True
+                errores = []
+                exitos  = 0
+
+                _MAX_MB    = 25
+                _MAX_BYTES = _MAX_MB * 1024 * 1024
+
+                for archivo, f_hash in nuevos_con_hash:
+                    file_bytes = archivo.getvalue()
+
+                    # 1. Límite de tamaño — antes de tocar S3
+                    if len(file_bytes) > _MAX_BYTES:
+                        errores.append(
+                            f"⚠️ '{archivo.name}' pesa {len(file_bytes)/(1024*1024):.1f} MB. "
+                            f"Máximo permitido: {_MAX_MB} MB. "
+                            f"Comprime el PDF o divídelo en partes."
+                        )
+                        continue
+
+                    # 2. Validación de magic bytes — los PDFs siempre empiezan con %PDF
+                    if not file_bytes.startswith(b'%PDF'):
+                        _log.warning("[UPLOAD INVALID PDF] empresa=%s archivo='%s' size=%d — magic bytes incorrectos",
+                                     st.session_state.empresa_id, archivo.name, len(file_bytes))
+                        errores.append(
+                            f"❌ '{html.escape(archivo.name)}' no es un PDF válido. "
+                            f"Solo se aceptan archivos PDF reales."
+                        )
+                        continue
+
+                    # 3. Verificar límite de plan por cada archivo (el cupo puede agotarse
+                    #    en mitad de un lote si otra pestaña o usuario sube simultáneamente)
+                    try:
+                        from core.planes import verificar_limite as _verificar_limite
+                        _puede_file, _msg_file = _verificar_limite(st.session_state.empresa_id)
+                        if not _puede_file:
+                            errores.append(f"Límite de plan alcanzado: {_msg_file}")
+                            break  # No procesar más archivos del lote
+                    except Exception:
+                        _log.debug("verificar_limite pre-upload falló", exc_info=True)
+
+                    # Loader animado por archivo
+                    _mostrar_loader(archivo.name)
+
+                    nombre_s3 = subir_pdf_a_s3(archivo, st.session_state.empresa_id)
+                    if nombre_s3:
+                        try:
+                            with engine.begin() as conn:
+                                existe = conn.execute(text(
+                                    "SELECT id FROM facturas WHERE nombre_s3 = :s3 "
+                                    "AND empresa_id = :eid "
+                                    "AND estado NOT IN ('error','borrado','completado') LIMIT 1"
+                                ), {"s3": nombre_s3, "eid": st.session_state.empresa_id}).fetchone()
+
+                            if not existe:
+                                procesar_factura_async.delay(nombre_s3, st.session_state.empresa_id)
+                                exitos += 1
+                                if DEBUG:
+                                    st.write(f"Tarea enviada: {nombre_s3}")
+
+                            st.session_state.procesados.add(f_hash)
+                        except Exception as e:
+                            _log.error("[UPLOAD ERROR] empresa=%s archivo='%s': %s",
+                                       st.session_state.empresa_id, archivo.name, e, exc_info=True)
+                            errores.append(f"❌ '{html.escape(archivo.name)}': error al enviar al motor. Inténtalo de nuevo.")
+                    else:
+                        errores.append(f"❌ Falló la subida de '{archivo.name}' a S3.")
+
+                st.session_state.enviando = False
+
+                # Toasts de resultado
+                if errores:
+                    for err in errores:
+                        st.error(err)
+                if exitos > 0:
+                    st.toast(
+                        f"{'Factura enviada' if exitos == 1 else f'{exitos} facturas enviadas'} al motor ATLAS",
+                        icon="🚀",
+                    )
+                    st.success(
+                        f"✅ {'1 factura procesada' if exitos == 1 else f'{exitos} facturas procesadas'}. "
+                        f"Los resultados aparecerán abajo en unos segundos."
+                    )
+                    # Guardar baseline para el polling por conteo de filas
+                    try:
+                        with engine.connect() as conn:
+                            st.session_state.facturas_antes = conn.execute(
+                                text("SELECT COUNT(*) FROM facturas WHERE empresa_id = :eid AND estado NOT IN ('error','borrado')"),
+                                {"eid": st.session_state.empresa_id}
+                            ).scalar() or 0
+                    except Exception:
+                        st.session_state.facturas_antes = 0
+                    st.session_state.tareas_en_vuelo = exitos
+                    st.session_state.poll_inicio     = time.time()
+
+                time.sleep(1)
+                st.rerun()
+        else:
+            st.success("Todos los archivos seleccionados ya están siendo procesados.")
+
+    col_limpiar, _ = st.columns([1, 3])
+    with col_limpiar:
+        if st.button("Limpiar historial de subida", width='stretch'):
+            # FIX: incrementar key fuerza al uploader a recrearse limpio
+            # sin tocar logged ni empresa_id — no rompe la sesión
+            st.session_state.procesados   = set()
+            st.session_state.uploader_key = st.session_state.get("uploader_key", 0) + 1
+            st.session_state.enviando     = False
+            st.rerun()
+
+    st.divider()
+
+    # Polling por conteo de filas — no depende de estados Celery ni de
+    # estados transitorios ('analizando','procesando') que el worker no escribe.
+    # Detecta nuevas facturas comparando COUNT(*) actual con el baseline guardado.
+    if st.session_state.get("tareas_en_vuelo", 0) > 0:
+        tiempo_esperando = time.time() - st.session_state.get("poll_inicio", time.time())
+        completado = False
+
+        if tiempo_esperando > 120:
+            # Timeout de seguridad: dejar de esperar tras 2 minutos
+            st.session_state.tareas_en_vuelo = 0
+            completado = True
+        else:
+            try:
+                with engine.connect() as conn:
+                    count_actual = conn.execute(
+                        text("SELECT COUNT(*) FROM facturas WHERE empresa_id = :eid AND estado NOT IN ('error','borrado')"),
+                        {"eid": st.session_state.empresa_id}
+                    ).scalar() or 0
+            except Exception:
+                count_actual = st.session_state.facturas_antes
+
+            esperadas = st.session_state.facturas_antes + st.session_state.tareas_en_vuelo
+            if count_actual >= esperadas:
+                st.session_state.tareas_en_vuelo = 0
+                completado = True
+
+        if not completado:
+            n = st.session_state.tareas_en_vuelo
+            st.markdown(f"""
+            <div style="
+                background: linear-gradient(135deg, #F5EDE6, #FFF8F5);
+                border: 1px solid rgba(100,48,31,0.15);
+                border-left: 4px solid #64301f;
+                border-radius: 8px;
+                padding: 14px 18px;
+                display: flex;
+                align-items: center;
+                gap: 12px;
+                margin-bottom: 12px;
+            ">
+                <span style="font-size:1.4rem">⚙️</span>
+                <div>
+                    <strong style="color:#64301f">Motor ATLAS trabajando</strong><br>
+                    <span style="font-size:0.82rem;color:#8C7B75">
+                        {n} factura{'s' if n != 1 else ''} en proceso · actualizando automáticamente…
+                    </span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            time.sleep(3)
+            st.rerun()
+
+    render_mesa_trabajo()
+
+    # Dataset de correcciones humanas (solo admin)
+    if st.session_state.get("rol") == "admin":
+        st.divider()
+        with st.expander("Dataset de Correcciones (IA vs Humano)", expanded=False):
+            try:
+                from services.trace_service import load_corrections
+                correcciones = load_corrections(st.session_state.empresa_id, limit=200)
+            except Exception:
+                correcciones = []
+            if not correcciones:
+                st.caption("Sin correcciones registradas todavía.")
+            else:
+                st.caption(f"{len(correcciones)} correcciones registradas")
+                df_corr = pd.DataFrame(correcciones)[["campo", "ia_extrajo", "humano_puso", "factura_emisor", "fecha"]]
+                df_corr.columns = ["Campo", "IA extrajo", "Humano puso", "Emisor", "Fecha"]
+                st.dataframe(df_corr, hide_index=True, use_container_width=True)
+                import json as _json
+                def _serial(obj):
+                    if hasattr(obj, "isoformat"):
+                        return obj.isoformat()
+                    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+                jsonl_lines = "\n".join(_json.dumps(c, ensure_ascii=False, default=_serial) for c in correcciones)
+                st.download_button(
+                    "Exportar JSONL",
+                    data=jsonl_lines,
+                    file_name=f"correcciones_empresa_{st.session_state.empresa_id}.jsonl",
+                    mime="application/jsonl",
+                    key="dl_correcciones",
+                )

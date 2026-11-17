@@ -1,0 +1,578 @@
+import re
+import streamlit as st
+import pandas as pd
+
+from db.database import (
+    get_db,
+    leer_facturas_seguras,
+    leer_clientes,
+    eliminar_factura_segura,
+    buscar_facturas,
+    corregir_importes_y_aprender, 
+)
+
+from ui.exportacion import _a_gestoria_df, generar_excel_gestoria
+from core.logger import get_logger
+_log = get_logger("iatlas.ui.panel")
+
+_PANEL_PAGE_SIZE = 200
+
+# ── Quick chips ────────────────────────────────────────────────────────────────
+_CHIPS = [
+    ("⚡ Luz",             "facturas de electricidad y luz"),
+    ("⛽ Gasolina",        "gastos de gasolina y combustible"),
+    ("🏠 Vivienda",        "gastos de vivienda alquiler hipoteca"),
+    ("💻 Software",        "software suscripciones servicios digitales"),
+    ("📑 Autónomos",       "facturas autónomos retención IRPF"),
+    ("🚨 Posibles errores","facturas sin CIF importe sospechoso IVA incorrecto"),
+    ("📈 Gastos altos",    "facturas con importe elevado gastos altos"),
+]
+
+# ── Presets de búsqueda orientados a gestorías ────────────────────────────────
+_PRESETS: dict[str, list[tuple[str, str]]] = {
+    "🧾 Preparar Renta": [
+        ("🏠 Deducibles vivienda",  "gastos deducibles vivienda alquiler"),
+        ("💡 Suministros",          "suministros luz agua gas"),
+        ("🍽️ Dietas",              "dietas restaurante comida manutención"),
+        ("🚗 Vehículos",           "gasolina combustible vehículo coche"),
+        ("📚 Formación",           "formación curso libro máster"),
+        ("🖥️ Material trabajo",   "material oficina ordenador impresora"),
+    ],
+    "🚨 Revisar Riesgos": [
+        ("❌ Sin CIF",             "factura sin CIF proveedor desconocido"),
+        ("⚠️ IVA raro",           "IVA incoherente cero exento"),
+        ("🔍 Tickets sospechosos", "ticket importe bajo sospechoso"),
+        ("💸 Posibles duplicados", "importes duplicados misma cantidad"),
+        ("🛍️ Gastos personales",  "gastos personales ocio entretenimiento"),
+    ],
+    "📈 Análisis Negocio": [
+        ("🔄 Suscripciones",       "suscripción recurrente mensual anual"),
+        ("💰 Gastos más altos",    "gastos elevados importe alto"),
+        ("🏭 Proveedores top",     "principales proveedores habituales"),
+        ("⚡ Energía",             "luz electricidad energía gas suministro"),
+    ],
+}
+
+_PLACEHOLDER_EXAMPLES = [
+    "gastos de gasolina del último trimestre",
+    "facturas duplicadas",
+    "tickets sospechosos",
+    "suscripciones IA",
+    "gastos deducibles vivienda",
+    "compras Amazon",
+    "facturas sin IVA",
+]
+
+
+def _extract_why(query: str, summary: str) -> list[str]:
+    """Return 2-4 match-reason tags from a document_summary string."""
+    if not summary:
+        return []
+    reasons: list[str] = []
+
+    # 1. Explicit semantic category — both old ("Categoría probable:") and new ("Categoría:") format
+    m = re.search(r'Categor[ií]a(?:\s+probable)?:\s*([^.]+)', summary, re.I)
+    if m:
+        reasons.append(m.group(1).strip())
+
+    # 2. Query-term overlap — skip very generic words
+    _SKIP = {
+        "factura", "facturas", "gasto", "gastos", "importe", "total",
+        "ultimo", "ultima", "trimestre", "año", "mes", "para", "como",
+        "sobre", "todas", "todos", "esta", "este",
+    }
+    q_words = [
+        w.lower()
+        for w in re.findall(r'\b[a-záéíóúüñ]{4,}\b', query, re.I)
+        if w.lower() not in _SKIP
+    ]
+    s_lower = summary.lower()
+    for w in q_words:
+        if w in s_lower:
+            reasons.append(w)
+
+    # Deduplicate preserving order, max 4
+    seen: set[str] = set()
+    out: list[str] = []
+    for r in reasons:
+        key = r.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+        if len(out) >= 4:
+            break
+    return out
+
+
+def _render_search_hero() -> str:
+    """Render the big search bar + chips + presets. Returns the current query."""
+
+    # ── CSS ──────────────────────────────────────────────────────────────────
+    st.markdown("""
+<style>
+/* Agrandar el text_input de búsqueda semántica */
+[data-testid="stTextInput"][aria-label="🔍 Búsqueda inteligente"] input,
+div[data-testid="stTextInputRootElement"] input {
+    font-size: 1.15rem !important;
+    padding: 0.75rem 1rem !important;
+    border-radius: 12px !important;
+}
+.sem-chip button {
+    border-radius: 20px !important;
+    font-size: 0.82rem !important;
+    padding: 0.2rem 0.75rem !important;
+}
+.sem-why {
+    font-size: 0.78rem;
+    color: #6c757d;
+    margin-top: 4px;
+}
+.sem-score-badge {
+    display: inline-block;
+    background: #e8f4fd;
+    color: #1a6fa8;
+    border-radius: 8px;
+    padding: 1px 8px;
+    font-size: 0.78rem;
+    font-weight: 600;
+}
+</style>
+""", unsafe_allow_html=True)
+
+    st.markdown("#### Búsqueda inteligente")
+    st.caption(
+        "Escribe en lenguaje natural o pulsa un chip. "
+        "Ejemplos: *" + "*, *".join(_PLACEHOLDER_EXAMPLES[:4]) + "*…"
+    )
+
+    # ── Main input ────────────────────────────────────────────────────────────
+    query_input = st.text_input(
+        "🔍 Búsqueda inteligente",
+        value=st.session_state.get("_sem_query", ""),
+        placeholder="Pregunta algo sobre tus facturas…",
+        label_visibility="collapsed",
+        key="_sem_input",
+    )
+    # Sync input → state (chips write directly to _sem_query)
+    if query_input != st.session_state.get("_sem_query", ""):
+        st.session_state["_sem_query"] = query_input
+
+    # ── Quick chips ───────────────────────────────────────────────────────────
+    st.markdown('<div class="sem-chip">', unsafe_allow_html=True)
+    chip_cols = st.columns(len(_CHIPS))
+    for i, (label, q) in enumerate(_CHIPS):
+        if chip_cols[i].button(label, key=f"_chip_{i}", use_container_width=True):
+            st.session_state["_sem_query"] = q
+            st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── Presets ───────────────────────────────────────────────────────────────
+    with st.expander("Búsquedas presets — Renta · Riesgos · Negocio", expanded=False):
+        preset_tabs = st.tabs(list(_PRESETS.keys()))
+        for tab, (section_label, items) in zip(preset_tabs, _PRESETS.items()):
+            with tab:
+                preset_cols = st.columns(3)
+                for j, (btn_label, btn_q) in enumerate(items):
+                    if preset_cols[j % 3].button(
+                        btn_label,
+                        key=f"_preset_{section_label}_{j}",
+                        use_container_width=True,
+                    ):
+                        st.session_state["_sem_query"] = btn_q
+                        st.rerun()
+
+    return st.session_state.get("_sem_query", "").strip()
+
+
+def _render_search_results(query: str, empresa_id: int) -> None:
+    """Run busqueda_hibrida and render result cards with match explanation."""
+    import traceback
+    from core.logger import get_logger
+    _slog = get_logger("iatlas.panel.search")
+
+    try:
+        from services.semantic_service import busqueda_hibrida
+    except ImportError as ie:
+        st.error(f"Módulo de búsqueda semántica no disponible: {ie}")
+        _slog.error("[SEARCH] ImportError: %s", ie)
+        return
+
+    try:
+        with st.spinner("Buscando…"):
+            resultados = busqueda_hibrida(query, empresa_id, top_k=15)
+    except Exception as e:
+        st.error(f"Error en búsqueda semántica: {e}")
+        _slog.error("[SEARCH] busqueda_hibrida falló: %s\n%s", e, traceback.format_exc())
+        return
+
+    if not resultados:
+        # Diagnóstico: comprobar cuántas facturas tienen embedding para orientar al usuario
+        try:
+            from db.database import get_db
+            conn = get_db()
+            try:
+                c = conn.cursor()
+                c.execute(
+                    "SELECT COUNT(*) FROM facturas WHERE empresa_id = %s AND embedding IS NOT NULL",
+                    (empresa_id,),
+                )
+                n_con_embedding = c.fetchone()[0]
+            finally:
+                conn.close()
+
+            if n_con_embedding == 0:
+                st.warning(
+                    "No hay facturas con embedding generado aún. "
+                    "Ve al panel de Admin → **Backfill de Embeddings** y pulsa **Lanzar Backfill**."
+                )
+            else:
+                st.info(
+                    f"No se encontraron facturas para «{query}». "
+                    f"Hay {n_con_embedding} factura(s) con embedding. "
+                    "Prueba con otras palabras o un chip de categoría."
+                )
+        except Exception as diag_e:
+            _slog.warning("[SEARCH] Diagnóstico de embedding falló: %s", diag_e)
+            st.info(
+                "No se encontraron facturas para esa búsqueda. "
+                "Prueba con otras palabras o usa un chip de categoría."
+            )
+        return
+
+    st.success(f"**{len(resultados)}** resultado{'s' if len(resultados) != 1 else ''} encontrado{'s' if len(resultados) != 1 else ''}")
+
+    for r in resultados:
+        score = float(r.get("score") or 0)
+        summary = str(r.get("document_summary") or "")
+        why_tags = _extract_why(query, summary)
+
+        with st.container(border=True):
+            c1, c2, c3, c4, c5 = st.columns([2, 1.5, 2, 1.5, 1])
+            c1.markdown(f"**{r.get('emisor') or '—'}**")
+            c2.markdown(f"📅 {r.get('fecha') or '—'}")
+            c3.markdown(f"Nº `{r.get('numero_factura') or '—'}`")
+            c4.markdown(f"**{float(r.get('total') or 0):.2f} €**")
+            c5.markdown(
+                f'<span class="sem-score-badge">{'⭐' if score >= 0.85 else ''}  {score:.0%}</span>',
+                unsafe_allow_html=True,
+            )
+
+            if why_tags:
+                tags_html = " ".join(
+                    f'<span style="background:#f0f2f6;border-radius:6px;'
+                    f'padding:2px 8px;font-size:0.78rem;margin-right:4px;">✓ {t}</span>'
+                    for t in why_tags
+                )
+                st.markdown(
+                    f'<div class="sem-why">Coincidencia encontrada por: {tags_html}</div>',
+                    unsafe_allow_html=True,
+                )
+            elif summary:
+                # Show first 120 chars of summary as context
+                snippet = summary[:120].rstrip() + ("…" if len(summary) > 120 else "")
+                st.caption(f"_{snippet}_")
+
+
+def panel_view():
+    st.title("Gestión de Facturas por Cliente")
+
+    # ── Search hero ────────────────────────────────────────────────────────────
+    query = _render_search_hero()
+
+    st.divider()
+
+    # ── Search mode ───────────────────────────────────────────────────────────
+    if query:
+        col_clear, _ = st.columns([1, 5])
+        if col_clear.button("✕ Limpiar búsqueda", key="_sem_clear"):
+            st.session_state["_sem_query"] = ""
+            st.rerun()
+        _render_search_results(query, st.session_state.empresa_id)
+        return
+
+    # ── Filtro literal por Cliente / Proveedor ─────────────────────────────────
+    # Independiente de la búsqueda semántica de arriba: aquí el usuario quiere
+    # localizar instantáneamente un documento conocido en el histórico.
+    f_col1, f_col2, f_col3 = st.columns([4, 2, 1])
+    filtro_texto = f_col1.text_input(
+        "Filtrar por cliente o proveedor",
+        value=st.session_state.get("_panel_filtro", ""),
+        placeholder="Nombre, CIF o nº de factura…",
+        key="_panel_filtro_input",
+    ).strip()
+    filtro_scope = f_col2.selectbox(
+        "Buscar en",
+        ["Ambos", "Cliente", "Proveedor"],
+        index=["Ambos", "Cliente", "Proveedor"].index(
+            st.session_state.get("_panel_scope", "Ambos")
+        ),
+        key="_panel_scope_sel",
+    )
+    if f_col3.button("✕ Limpiar", key="_panel_filtro_clear", use_container_width=True):
+        st.session_state["_panel_filtro"] = ""
+        st.session_state["_panel_scope"] = "Ambos"
+        st.session_state.pop("_panel_filtro_input", None)
+        st.session_state.pop("_panel_scope_sel", None)
+        st.rerun()
+
+    # Sync (sin rerun): el siguiente render leerá el valor actualizado.
+    st.session_state["_panel_filtro"] = filtro_texto
+    st.session_state["_panel_scope"]  = filtro_scope
+
+    # ── Normal mode: lista paginada de facturas ────────────────────────────────
+    if "panel_pagina" not in st.session_state:
+        st.session_state.panel_pagina = 0
+
+    if filtro_texto:
+        # Modo filtro: una sola página de hasta 500 resultados, sin paginador.
+        facturas = buscar_facturas(
+            st.session_state.empresa_id,
+            filtro_texto,
+            scope=filtro_scope.lower(),
+            limit=500,
+            offset=0,
+        )
+        st.caption(
+            f"Filtro activo: «{filtro_texto}» en **{filtro_scope}** · "
+            f"{len(facturas)} resultado{'s' if len(facturas) != 1 else ''}"
+        )
+    else:
+        _offset = st.session_state.panel_pagina * _PANEL_PAGE_SIZE
+        facturas = leer_facturas_seguras(
+            st.session_state.empresa_id,
+            limit=_PANEL_PAGE_SIZE,
+            offset=_offset,
+        )
+
+    clientes_registrados = leer_clientes(st.session_state.empresa_id)
+
+    col_ref, col_exp, _ = st.columns([1, 2, 4])
+    if col_ref.button("Refrescar", width="stretch"):
+        st.rerun()
+
+    if not facturas:
+        if filtro_texto:
+            st.info(f"No hay facturas que coincidan con «{filtro_texto}».")
+        elif st.session_state.panel_pagina == 0:
+            st.info("No hay facturas registradas en el historial.")
+        return
+
+    # Navegación de páginas — solo en modo "histórico completo" (sin filtro)
+    if not filtro_texto:
+        _hay_mas = len(facturas) == _PANEL_PAGE_SIZE
+        if st.session_state.panel_pagina > 0 or _hay_mas:
+            _p1, _p2, _p3 = st.columns([1, 2, 1])
+            if _p1.button("← Anterior", disabled=(st.session_state.panel_pagina == 0), width="stretch"):
+                st.session_state.panel_pagina -= 1
+                st.rerun()
+            _p2.caption(
+                f"Página {st.session_state.panel_pagina + 1} · "
+                f"facturas {_offset + 1}–{_offset + len(facturas)}"
+            )
+            if _p3.button("Siguiente →", disabled=not _hay_mas, width="stretch"):
+                st.session_state.panel_pagina += 1
+                st.rerun()
+
+    df = pd.DataFrame(facturas)
+
+    # Quick-export
+    try:
+        completadas = df[df["estado"] == "completado"] if "estado" in df.columns else df
+        if not completadas.empty:
+            df_exp = pd.DataFrame({
+                "fecha":          completadas.get("fecha", pd.Series(dtype=str)).fillna(""),
+                "numero_factura": completadas.get("numero_factura", pd.Series(dtype=str)).fillna(""),
+                "emisor":         completadas.get("emisor", pd.Series(dtype=str)).fillna(""),
+                "cif_vendedor":   completadas.get("cif_vendedor", pd.Series(dtype=str)).fillna(""),
+                "base":           pd.to_numeric(completadas.get("base"), errors="coerce").fillna(0.0),
+                "iva":            pd.to_numeric(completadas.get("iva"), errors="coerce").fillna(0.0),
+                "importe_irpf":   pd.to_numeric(completadas.get("importe_irpf"), errors="coerce").fillna(0.0),
+                "exento":         pd.to_numeric(completadas.get("exento"), errors="coerce").fillna(0.0),
+                "total":          pd.to_numeric(completadas.get("total"), errors="coerce").fillna(0.0),
+            })
+            excel_bytes = generar_excel_gestoria(_a_gestoria_df(df_exp))
+            col_exp.download_button(
+                label=f"Exportar Excel ({len(completadas)} facturas)",
+                data=excel_bytes,
+                file_name="facturas_iatlas.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                width="stretch",
+            )
+    except Exception:
+        _log.debug("exportar Excel en panel falló", exc_info=True)
+
+    opciones_destino = ["Clientes Generales"] + [f"{c[1]} | {c[2]}" for c in clientes_registrados]
+
+    # Organización por grupos
+    grupos = {f"{c[1]} | {c[2]}": [] for c in clientes_registrados}
+    grupos["Clientes Generales"] = []
+
+    for _, row in df.iterrows():
+        asignada = False
+        for c in clientes_registrados:
+            if (str(row.get("cliente", "")).strip().upper() == str(c[1]).strip().upper()
+                    and str(row.get("cif_cliente", "")).strip().upper() == str(c[2]).strip().upper()):
+                grupos[f"{c[1]} | {c[2]}"].append(row)
+                asignada = True
+                break
+        if not asignada:
+            grupos["Clientes Generales"].append(row)
+
+    orden_grupos = [f"{c[1]} | {c[2]}" for c in clientes_registrados] + ["Clientes Generales"]
+
+    for nombre_grupo in orden_grupos:
+        lista_facs = grupos[nombre_grupo]
+        if not lista_facs:
+            continue
+
+        df_g    = pd.DataFrame(lista_facs)
+        total_g = pd.to_numeric(df_g["total"], errors="coerce").sum()
+
+        with st.expander(
+            f"📁 {nombre_grupo.upper()} — {len(lista_facs)} facturas — Total: {total_g:.2f} €",
+            expanded=True,
+        ):
+            for index, f in df_g.iterrows():
+                fid = f["id"]
+
+                with st.container(border=True):
+                    key_sel    = f"mov_{fid}"
+                    idx_actual = opciones_destino.index(nombre_grupo) if nombre_grupo in opciones_destino else 0
+
+                    if key_sel not in st.session_state:
+                        st.session_state[key_sel] = idx_actual
+
+                    col_sel, _ = st.columns([2, 2])
+                    with col_sel:
+                        nuevo_destino = st.selectbox(
+                            "Cambiar de grupo:",
+                            opciones_destino,
+                            index=st.session_state[key_sel],
+                            key=f"sel_{fid}",
+                        )
+
+                    if nuevo_destino != nombre_grupo:
+                        conn = None
+                        try:
+                            conn = get_db()
+                            c = conn.cursor()
+                            if nuevo_destino == "Clientes Generales":
+                                c.execute(
+                                    "UPDATE facturas SET cliente='', cif_cliente='' WHERE id=%s",
+                                    (fid,),
+                                )
+                            else:
+                                n_nom, n_cif = nuevo_destino.split(" | ")
+                                c.execute(
+                                    "UPDATE facturas SET cliente=%s, cif_cliente=%s WHERE id=%s",
+                                    (n_nom, n_cif, fid),
+                                )
+                            conn.commit()
+                            st.session_state[key_sel] = opciones_destino.index(nuevo_destino)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error al mover factura: {e}")
+                        finally:
+                            if conn:
+                                conn.close()
+
+                    # 1. Recuperamos las matemáticas (¡Vital para que no dé NameError!)
+                    base_val   = float(f.get("base") or 0)
+                    iva_val    = float(f.get("iva")  or 0)
+                    pct_iva    = round((iva_val / base_val) * 100) if base_val > 0 else 0
+                    exento_val = float(f.get("exento") or 0)
+                    irpf_val   = float(f.get("importe_irpf") or 0)
+                    total_val  = float(f.get("total") or 0)
+
+                    # === INICIO DEL FORMULARIO UNIVERSAL DE APRENDIZAJE ===
+                    with st.form(key=f"form_correccion_{fid}", border=False):
+                        st.markdown("<span style='font-size:0.85rem;color:#8C7B75;'>✏️ <b>Edición y Aprendizaje:</b> Corrige los datos aquí y la IA aprenderá dónde encontrarlos en el futuro.</span>", unsafe_allow_html=True)
+                        
+                        # --- Fila 1: Datos Generales (Editables) ---
+                        c_gen1, c_gen2, c_gen3, c_gen4 = st.columns([1, 1.5, 2, 2])
+                        with c_gen1:
+                            nueva_fecha = st.text_input("Fecha", value=f.get('fecha') or "", key=f"f_fe_{fid}")
+                        with c_gen2:
+                            nuevo_num = st.text_input("Nº Factura", value=f.get('numero_factura') or "", key=f"f_nu_{fid}")
+                        with c_gen3:
+                            nuevo_emi = st.text_input("Emisor", value=f.get('emisor') or "", key=f"f_em_{fid}")
+                        with c_gen4:
+                            nuevo_cli = st.text_input("Cliente", value=f.get('cliente') or "", key=f"f_cl_{fid}")
+
+                        st.markdown("---")
+                        
+                        # --- Fila 2: Desglose Económico ---
+                        st.caption(f"**CIF Vendedor:** {f.get('cif_vendedor') or '---'} (Gatillo) &nbsp;|&nbsp; **Tipo:** {f.get('tipo_factura') or 'Estándar'}")
+                        
+                        c1, c2, c3, c4 = st.columns([1.2, 1.2, 1.2, 2])
+                        with c1:
+                            nueva_base = st.number_input("Base Imponible (€)", value=base_val, step=0.01, format="%.2f", key=f"base_{fid}")
+                        with c2:
+                            nuevo_iva = st.number_input("Cuota IVA (€)", value=iva_val, step=0.01, format="%.2f", key=f"iva_{fid}")
+                        with c3:
+                            nuevo_total = st.number_input("Total Factura (€)", value=total_val, step=0.01, format="%.2f", key=f"tot_{fid}")
+                            
+                        with c4:
+                            st.markdown("<br>", unsafe_allow_html=True)
+                            btn_guardar = st.form_submit_button("💾 Guardar y Enseñar a la IA", type="primary", use_container_width=True)
+
+                        # --- Acción al pulsar el botón ---
+                        if btn_guardar:
+                            st.toast("Guardando corrección y entrenando sistema...", icon="🕵️‍♀️")
+                            
+                            cif_emisor = f.get('cif_vendedor', '')
+                            nombre_pdf = f.get('nombre_s3', '') 
+                            
+                            exito = corregir_importes_y_aprender(
+                                factura_id=fid, 
+                                cif_vendedor=cif_emisor, 
+                                nueva_base=nueva_base, 
+                                nuevo_iva=nuevo_iva, 
+                                nuevo_total=nuevo_total,
+                                nuevo_emisor=nuevo_emi,
+                                nuevo_cliente=nuevo_cli,      
+                                nueva_fecha=nueva_fecha,
+                                nuevo_numero=nuevo_num,
+                                nombre_s3=nombre_pdf
+                            )
+                            
+                            if exito:
+                                st.success("¡Datos guardados! I.Atlas ha aprendido el nuevo formato.")
+                                import time
+                                time.sleep(1.5)
+                                st.rerun()
+                            else:
+                                st.error("Hubo un error al actualizar la base de datos.")
+                    # === FIN DEL FORMULARIO ===
+
+                    _confirmar_del = st.session_state.get("_panel_confirmar_fid")
+                    _, _col_del = st.columns([5, 1])
+                    _col_del.button(
+                        "🗑️ Borrar",
+                        key=f"_del_fac_{fid}",
+                        help="Eliminar esta factura (acción reversible desde administración)",
+                        use_container_width=True,
+                        on_click=lambda _fid=fid: st.session_state.update(
+                            {"_panel_confirmar_fid": _fid}
+                        ),
+                    )
+
+                    if _confirmar_del == fid:
+                        with st.container(border=True):
+                            st.warning(
+                                f"¿Eliminar la factura **{f.get('numero_factura') or fid}** "
+                                f"de {f.get('emisor') or '---'}? "
+                                "El PDF se borrará de S3."
+                            )
+                            _dc1, _dc2, _ = st.columns([1, 1, 3])
+                            if _dc1.button("Sí, borrar", key=f"_conf_fac_{fid}", type="primary"):
+                                _ok = eliminar_factura_segura(fid, st.session_state.empresa_id)
+                                st.session_state.pop("_panel_confirmar_fid", None)
+                                if _ok:
+                                    st.toast("Factura eliminada.", icon="🗑️")
+                                else:
+                                    st.error("No se pudo eliminar la factura.")
+                                st.rerun()
+                            if _dc2.button("Cancelar", key=f"_canc_fac_{fid}"):
+                                st.session_state.pop("_panel_confirmar_fid", None)
+                                st.rerun()

@@ -1,0 +1,840 @@
+import os
+import hashlib
+import bcrypt
+import json
+from contextlib import contextmanager
+from datetime import datetime as _dt
+from sqlalchemy import create_engine, text as sql_text
+from sqlalchemy.exc import IntegrityError
+
+from core.logger import get_logger
+_log = get_logger("iatlas.db")
+
+# ---------------------------------------------------------------------------
+# 1. CONFIGURACIÓN DE CONEXIÓN
+# ---------------------------------------------------------------------------
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL no está definida. Añádela como variable de entorno.")
+
+if DATABASE_URL.startswith("postgres://"):
+    SQLALCHEMY_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+else:
+    SQLALCHEMY_URL = DATABASE_URL
+
+engine = create_engine(SQLALCHEMY_URL, pool_pre_ping=True)
+
+
+def _str_a_fecha(s):
+    """Convierte 'DD/MM/YYYY' o 'YYYY-MM-DD' a datetime.date; devuelve None si no es parseable."""
+    if not s:
+        return None
+    s = str(s).strip()
+    if not s:
+        return None
+    for fmt in ('%d/%m/%Y', '%Y-%m-%d', '%d-%m-%Y', '%Y/%m/%d'):
+        try:
+            return _dt.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def get_db():
+    """Returns a pooled DBAPI connection (psycopg2-compatible API via SQLAlchemy pool)."""
+    return engine.raw_connection()
+
+
+@contextmanager
+def db_conn():
+    """Context manager over get_db(): commits on success, rolls back on error, always closes."""
+    conn = get_db()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def hash_password(password: str) -> str:
+    """Genera un hash bcrypt con salt aleatorio. Seguro contra rainbow tables."""
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
+
+
+def verify_password(stored: str, provided: str) -> bool:
+    """
+    Verifica una contraseña contra su hash almacenado.
+    Soporta bcrypt (nuevo) y SHA-256 legacy (cuentas antiguas).
+    """
+    if not stored or not provided:
+        return False
+    if stored.startswith("$2b$") or stored.startswith("$2a$"):
+        return bcrypt.checkpw(provided.encode("utf-8"), stored.encode("utf-8"))
+    # Hash SHA-256 legacy — el re-hash a bcrypt ocurre en ui/auth.py:login_screen() tras login exitoso
+    return stored == hashlib.sha256(provided.encode("utf-8")).hexdigest()
+
+
+def eliminar_usuario(usuario_id: int) -> tuple[bool, str]:
+    """
+    Elimina un usuario por ID.
+    No elimina la empresa ni sus facturas — solo revoca el acceso.
+    Devuelve (True, 'ok') o (False, mensaje_de_error).
+    """
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("DELETE FROM usuarios WHERE id = %s", (usuario_id,))
+        eliminado = c.rowcount
+        conn.commit()
+        conn.close()
+        if eliminado == 0:
+            return False, f"Usuario {usuario_id} no encontrado"
+        _log.info("[ADMIN] Usuario %d eliminado", usuario_id)
+        return True, "ok"
+    except Exception as e:
+        _log.error("[ADMIN] Error eliminando usuario %d: %s", usuario_id, e)
+        return False, str(e)
+
+
+# ---------------------------------------------------------------------------
+# 2. INICIALIZACIÓN DE TABLAS
+# ---------------------------------------------------------------------------
+
+def init_db():
+    conn = get_db()
+    c = conn.cursor()
+    try:
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS facturas (
+            id SERIAL PRIMARY KEY,
+            numero_factura TEXT,
+            fecha DATE,
+            emisor TEXT,
+            cif_vendedor TEXT,
+            cliente TEXT,
+            cif_cliente TEXT,
+            base REAL,
+            exento REAL,
+            iva REAL,
+            importe_irpf REAL DEFAULT 0.0,
+            total REAL,
+            estado VARCHAR(50) DEFAULT 'pendiente',
+            empresa_id INTEGER DEFAULT 1,
+            metodo_extraccion TEXT,
+            nombre_s3 TEXT,
+            confianza INTEGER,
+            tiempo_proceso REAL DEFAULT 0.0,
+            intentos_ia INTEGER DEFAULT 0
+        )
+        """)
+
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_learning_tables():
+    """Crea las tablas del módulo de aprendizaje si no existen."""
+    conn = get_db()
+    c = conn.cursor()
+    try:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS aprendizaje_proveedores (
+                id            SERIAL PRIMARY KEY,
+                patron_texto  TEXT UNIQUE NOT NULL,
+                emisor_ok     TEXT,
+                cif_ok        TEXT,
+                confianza     INTEGER DEFAULT 60,
+                usos          INTEGER DEFAULT 0,
+                updated_at    TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS correcciones_facturas (
+                id             SERIAL PRIMARY KEY,
+                id_factura     INTEGER,
+                campo          TEXT,
+                valor_anterior TEXT,
+                valor_nuevo    TEXT,
+                fecha          TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        conn.commit()
+    except Exception as e:
+        _log.warning("[LEARNING] Error creando tablas: %s", e)
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# PUNTO ÚNICO DE ARRANQUE
+# ---------------------------------------------------------------------------
+
+def initialize_app() -> None:
+    """
+    Consolida las 5 llamadas init_*() dispersas en app.py en un único punto.
+    Las importaciones tardías evitan imports circulares con services/ y core/.
+    """
+    init_db()
+    crear_tablas_iniciales()
+
+    try:
+        from services.proveedores_service import init_proveedores
+        init_proveedores()
+    except Exception as e:
+        _log.warning("[INIT] proveedores: %s", e)
+
+    try:
+        from core.planes import init_planes_tables
+        init_planes_tables()
+    except Exception as e:
+        _log.warning("[INIT] planes: %s", e)
+
+    try:
+        init_learning_tables()
+    except Exception as e:
+        _log.warning("[INIT] learning: %s", e)
+
+    _log.info("[INIT] Aplicación inicializada.")
+
+
+# ---------------------------------------------------------------------------
+# 3. GUARDADO DE FACTURAS
+# ---------------------------------------------------------------------------
+
+def guardar_factura_segura(data, empresa_id, factura_id):
+    data = dict(data or {})
+    # Último cinturón antes de DB: si el pipeline trae _locked_fields de
+    # strong_ocr, sus valores autoritativos rellenan los campos canónicos y
+    # sus alias de persistencia aunque algún serializador intermedio los omita.
+    locks = data.get("_locked_fields") or {}
+    for campo, meta in locks.items():
+        if not isinstance(meta, dict):
+            continue
+        valor = meta.get("value")
+        if valor in (None, ""):
+            continue
+        if campo in ("cif_vendedor", "cif", "cif_emisor", "nif", "nif_emisor"):
+            if not (data.get("cif_vendedor") or data.get("cif") or data.get("cif_emisor")):
+                data["cif_vendedor"] = valor
+                data["cif"] = valor
+                data["cif_emisor"] = valor
+        elif campo in ("numero_factura", "numero", "referencia"):
+            if not (data.get("numero_factura") or data.get("numero")):
+                data["numero_factura"] = valor
+                data["numero"] = valor
+        elif campo in ("total", "total_factura"):
+            if not (data.get("total") or data.get("total_factura")):
+                data["total"] = valor
+                data["total_factura"] = valor
+
+    emisor         = data.get("emisor") or data.get("nombre_vendedor") or "Proveedor Desconocido"
+    cif_vendedor   = (
+        data.get("cif_vendedor") or data.get("cif") or data.get("cif_emisor")
+        or data.get("nif") or data.get("nif_emisor")
+    )
+    numero_factura = data.get("numero_factura") or data.get("numero") or data.get("referencia")
+    cliente        = data.get("cliente") or data.get("nombre_cliente") or ""
+    cif_cliente    = data.get("cif_cliente") or data.get("nif_cliente")
+    fecha          = _str_a_fecha(data.get("fecha") or data.get("fecha_emision"))
+
+    total          = float(data.get("total") or data.get("total_factura")          or 0.0)
+    base           = float(data.get("base_imponible") or data.get("base")          or 0.0)
+    iva            = float(data.get("iva")                                         or 0.0)
+    exento         = float(data.get("exento")                                      or 0.0)
+    imp_irpf       = float(data.get("irpf")           or data.get("importe_irpf") or 0.0)
+    tiempo_proceso = float(data.get("tiempo_proceso") or 0.0)
+    intentos_ia    = int(data.get("intentos_ia")      or 0)
+    confianza      = int(data.get("confianza")        or 0)
+
+    # Estado basado en confianza.
+    # 'completado' solo lo puede poner el usuario desde la UI — nunca el extractor.
+    estado_extractor = data.get("estado")
+    if estado_extractor and estado_extractor != "completado":
+        estado_final = estado_extractor
+    elif confianza < 60:
+        estado_final = "pendiente_revision"
+    else:
+        estado_final = "pendiente"
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(sql_text("""
+                UPDATE facturas SET
+                    emisor            = :emisor,
+                    cif_vendedor      = :cif_v,
+                    cliente           = :cliente,
+                    cif_cliente       = :cif_c,
+                    numero_factura    = :num,
+                    fecha             = :fecha,
+                    base              = :base,
+                    exento            = :exento,
+                    iva               = :iva,
+                    importe_irpf      = :irpf,
+                    total             = :total,
+                    metodo_extraccion = :metodo,
+                    confianza         = :confianza,
+                    estado            = :estado,
+                    tiempo_proceso    = :t_proceso,
+                    intentos_ia       = :intentos,
+                    hash_texto        = COALESCE(:hash, hash_texto)
+                WHERE id = :fid AND empresa_id = :eid
+            """), {
+                "emisor":    str(emisor)[:250],
+                "cif_v":     str(cif_vendedor or "")[:20],
+                "cliente":   str(cliente)[:250],
+                "cif_c":     str(cif_cliente or "")[:20],
+                "num":       str(numero_factura or "")[:100],
+                "fecha":     fecha,
+                "base":      base,
+                "exento":    exento,
+                "iva":       iva,
+                "irpf":      imp_irpf,
+                "total":     total,
+                "metodo":    data.get("metodo_extraccion"),
+                "confianza": confianza,
+                "estado":    estado_final,
+                "t_proceso": tiempo_proceso,
+                "intentos":  intentos_ia,
+                "hash":      data.get("hash_texto"),
+                "fid":       factura_id,
+                "eid":       empresa_id,
+            })
+        return True
+
+    except IntegrityError:
+        # Race condition: dos uploads simultáneos del mismo PDF.
+        # Marcamos la fila phantom como error para que no quede huérfana.
+        _log.warning("[GUARDADO] Factura %d: duplicado por constraint DB — marcando phantom como error.", factura_id)
+        try:
+            with engine.begin() as conn2:
+                conn2.execute(
+                    sql_text("UPDATE facturas SET estado = 'error' WHERE id = :fid AND empresa_id = :eid"),
+                    {"fid": factura_id, "eid": empresa_id},
+                )
+        except Exception:
+            _log.debug("No se pudo marcar phantom como error", exc_info=True)
+        return False
+
+    except Exception as e:
+        _log.error("[GUARDADO] Factura %d: %s", factura_id, e, exc_info=True)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# 4. LECTURAS
+# ---------------------------------------------------------------------------
+
+def leer_facturas_seguras(empresa_id, limit: int = 200, offset: int = 0):
+    conn = get_db()
+    c = conn.cursor()
+    try:
+        c.execute("""
+            SELECT id, numero_factura, TO_CHAR(fecha, 'DD/MM/YYYY') AS fecha,
+                   emisor, cif_vendedor, cliente, cif_cliente,
+                   base, exento, iva, importe_irpf, total,
+                   estado, empresa_id, metodo_extraccion,
+                   nombre_s3, confianza, tiempo_proceso, intentos_ia, hash_texto,
+                   tipo_factura
+            FROM facturas
+            WHERE empresa_id=%s AND estado != 'borrado'
+            ORDER BY id DESC
+            LIMIT %s OFFSET %s
+        """, (empresa_id, limit, offset))
+        columnas = [desc[0] for desc in c.description]
+        return [dict(zip(columnas, row)) for row in c.fetchall()]
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+
+def leer_facturas_db(empresa_id, limit: int = 200, offset: int = 0):
+    conn = None
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("""
+            SELECT id, emisor, cif_vendedor, numero_factura,
+                   TO_CHAR(fecha, 'DD/MM/YYYY') AS fecha,
+                   total, estado, confianza, metodo_extraccion,
+                   tiempo_proceso, intentos_ia, tipo_factura
+            FROM facturas
+            WHERE empresa_id = %s
+            ORDER BY id DESC
+            LIMIT %s OFFSET %s
+        """, (empresa_id, limit, offset))
+        columnas = [desc[0] for desc in c.description]
+        return [dict(zip(columnas, row)) for row in c.fetchall()]
+    except Exception as e:
+        _log.error("Error al leer facturas: %s", e)
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 4.b BÚSQUEDA LITERAL (cliente / proveedor) y EDICIÓN DE TIPO DE FACTURA
+# ---------------------------------------------------------------------------
+
+# Catálogo único de tipos editables — usado tanto por la UI (selector) como por
+# el helper de actualización para validar el valor entrante.
+TIPOS_FACTURA = (
+    "Estándar",
+    "Suministros",
+    "Gasolina / Combustible",
+    "Energía",
+    "Telefonía / Internet",
+    "Material de oficina",
+    "Servicios profesionales",
+    "Restaurante / Dietas",
+    "Transporte / Viajes",
+    "Alquiler / Vivienda",
+    "Otros",
+)
+
+
+def buscar_facturas(
+    empresa_id,
+    texto: str,
+    scope: str = "ambos",
+    limit: int = 200,
+    offset: int = 0,
+):
+    """
+    Filtrado literal de facturas por cliente y/o proveedor.
+
+    `scope` admite: 'cliente' | 'proveedor' | 'ambos'. La consulta usa ILIKE
+    sobre los campos textuales relevantes (nombre + CIF + número de factura
+    cuando el scope es 'ambos') y se apoya en los índices compuestos por
+    empresa_id ya existentes (ver migración 015). El patrón %texto% impide
+    el uso del índice b-tree para igualdad, pero al estar la consulta
+    siempre acotada por empresa_id y estado != 'borrado' el plan resultante
+    es un Index Scan + Filter — suficiente para volúmenes de gestoría.
+
+    Devuelve la misma forma de dict que `leer_facturas_seguras` para que la
+    UI pueda intercambiarlas sin cambios.
+    """
+    patron = f"%{(texto or '').strip()}%"
+    if not patron or patron == "%%":
+        return leer_facturas_seguras(empresa_id, limit=limit, offset=offset)
+
+    scope = (scope or "ambos").lower()
+    if scope == "cliente":
+        where_extra = "AND (cliente ILIKE %s OR cif_cliente ILIKE %s)"
+        params = (empresa_id, patron, patron, limit, offset)
+    elif scope == "proveedor":
+        where_extra = "AND (emisor ILIKE %s OR cif_vendedor ILIKE %s)"
+        params = (empresa_id, patron, patron, limit, offset)
+    else:  # ambos
+        where_extra = (
+            "AND (cliente ILIKE %s OR cif_cliente ILIKE %s "
+            "OR emisor ILIKE %s OR cif_vendedor ILIKE %s "
+            "OR numero_factura ILIKE %s)"
+        )
+        params = (empresa_id, patron, patron, patron, patron, patron, limit, offset)
+
+    conn = get_db()
+    c = conn.cursor()
+    try:
+        c.execute(f"""
+            SELECT id, numero_factura, TO_CHAR(fecha, 'DD/MM/YYYY') AS fecha,
+                   emisor, cif_vendedor, cliente, cif_cliente,
+                   base, exento, iva, importe_irpf, total,
+                   estado, empresa_id, metodo_extraccion,
+                   nombre_s3, confianza, tiempo_proceso, intentos_ia, hash_texto,
+                   tipo_factura
+            FROM facturas
+            WHERE empresa_id = %s
+              AND estado != 'borrado'
+              {where_extra}
+            ORDER BY id DESC
+            LIMIT %s OFFSET %s
+        """, params)
+        columnas = [desc[0] for desc in c.description]
+        return [dict(zip(columnas, row)) for row in c.fetchall()]
+    except Exception as e:
+        _log.error("[BUSCAR] empresa=%s scope=%s: %s", empresa_id, scope, e)
+        return []
+    finally:
+        conn.close()
+
+
+def actualizar_tipo_factura(factura_id: int, empresa_id: int, nuevo_tipo: str):
+    """
+    Actualiza EXCLUSIVAMENTE la columna tipo_factura. No toca importes, NIFs,
+    embeddings ni estado de extracción — pensado para reclasificaciones manuales
+    desde la UI tras una predicción incorrecta del clasificador.
+
+    Devuelve (True, 'ok') o (False, motivo).
+    """
+    valor = (nuevo_tipo or "").strip() or None
+    if valor is not None and valor not in TIPOS_FACTURA:
+        return False, f"Tipo no permitido: {valor!r}"
+
+    try:
+        with engine.begin() as conn:
+            res = conn.execute(sql_text("""
+                UPDATE facturas
+                SET tipo_factura = :tipo
+                WHERE id = :fid AND empresa_id = :eid
+            """), {"tipo": valor, "fid": factura_id, "eid": empresa_id})
+            if res.rowcount == 0:
+                return False, "Factura no encontrada"
+        _log.info("[TIPO] Factura %d (empresa %d) reclasificada a %r", factura_id, empresa_id, valor)
+        return True, "ok"
+    except Exception as e:
+        _log.error("[TIPO] Error actualizando factura %s: %s", factura_id, e, exc_info=True)
+        return False, str(e)
+
+
+# ---------------------------------------------------------------------------
+# 5. ELIMINACIÓN Y DUPLICADOS
+# ---------------------------------------------------------------------------
+
+def eliminar_factura_segura(factura_id, empresa_id):
+    """
+    Soft-delete: marca la fila como estado='borrado' y elimina el PDF de S3.
+    Nunca borra la fila de BD — los datos son recuperables y los JOINs no se rompen.
+    La eliminación S3 es best-effort: si falla, la fila queda igualmente borrada.
+    """
+    conn = get_db()
+    c = conn.cursor()
+    try:
+        # Obtener nombre_s3 antes de marcar como borrado
+        c.execute(
+            "SELECT nombre_s3 FROM facturas WHERE id=%s AND empresa_id=%s",
+            (factura_id, empresa_id)
+        )
+        row = c.fetchone()
+        nombre_s3 = row[0] if row else None
+
+        c.execute(
+            "UPDATE facturas SET estado='borrado' WHERE id=%s AND empresa_id=%s",
+            (factura_id, empresa_id)
+        )
+        conn.commit()
+
+        # Auditoría — fire-and-forget
+        try:
+            from core.auditoria import registrar_accion
+            registrar_accion(
+                empresa_id=empresa_id,
+                accion="eliminar_factura",
+                detalles={"factura_id": factura_id, "nombre_s3": nombre_s3},
+            )
+        except Exception as _audit_err:
+            _log.debug("Auditoría eliminar_factura falló: %s", _audit_err)
+
+        # Eliminar PDF de S3 si existe — fallo silencioso para no bloquear la UI
+        if nombre_s3:
+            try:
+                from services.storage_service import s3_client, AWS_BUCKET
+                s3_client.delete_object(Bucket=AWS_BUCKET, Key=nombre_s3)
+                # Intentar borrar también el .txt de caché OCR si existe
+                txt_key = nombre_s3.rsplit(".", 1)[0] + ".txt"
+                s3_client.delete_object(Bucket=AWS_BUCKET, Key=txt_key)
+            except Exception as s3_err:
+                _log.warning("[S3] No se pudo borrar %s: %s", nombre_s3, s3_err)
+
+        return True
+    finally:
+        conn.close()
+
+
+def es_factura_duplicada(numero_factura, cif_vendedor, empresa_id, hash_texto=None):
+    """
+    Comprueba duplicados en dos pasos:
+
+    1. Primario — (cif_vendedor, numero_factura): identidad fiscal real.
+       Es la comprobación más fiable y rápida.
+
+    2. Fallback — hash_texto (SHA-256 del OCR): cuando no hay CIF.
+       Detecta re-subidas del mismo PDF escaneado aunque el proveedor
+       no haya podido identificarse.
+    """
+    # ── Paso 1: CIF + número ────────────────────────────────────────────────
+    if numero_factura and cif_vendedor:
+        conn = get_db()
+        c = conn.cursor()
+        try:
+            c.execute("""
+                SELECT id FROM facturas
+                WHERE cif_vendedor = %s
+                  AND numero_factura = %s
+                  AND empresa_id = %s
+                  AND estado NOT IN ('borrado', 'error')
+            """, (
+                str(cif_vendedor).strip().upper(),
+                str(numero_factura).strip(),
+                empresa_id,
+            ))
+            if c.fetchone():
+                return True
+        finally:
+            conn.close()
+
+    # ── Paso 2: fallback por hash del texto OCR ─────────────────────────────
+    if hash_texto:
+        conn = get_db()
+        c = conn.cursor()
+        try:
+            c.execute("""
+                SELECT id FROM facturas
+                WHERE hash_texto = %s
+                  AND empresa_id = %s
+                  AND estado NOT IN ('borrado', 'error')
+            """, (str(hash_texto), empresa_id))
+            if c.fetchone():
+                return True
+        finally:
+            conn.close()
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# 6. CLIENTES
+# ---------------------------------------------------------------------------
+
+def guardar_cliente(nombre, nif, direccion, cuenta, empresa_id):
+    conn = get_db()
+    c = conn.cursor()
+    try:
+        c.execute("""
+            INSERT INTO clientes (nombre, nif, direccion, cuenta_contable, empresa_id)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (nif) DO UPDATE SET
+                nombre           = EXCLUDED.nombre,
+                direccion        = EXCLUDED.direccion,
+                cuenta_contable  = EXCLUDED.cuenta_contable
+        """, (nombre, nif, direccion, cuenta, empresa_id))
+        conn.commit()
+        return True, "Ok"
+    except Exception as e:
+        return False, str(e)
+    finally:
+        conn.close()
+
+
+def leer_clientes(empresa_id):
+    conn = get_db()
+    c = conn.cursor()
+    try:
+        c.execute(
+            "SELECT id, nombre, nif, direccion, cuenta_contable FROM clientes WHERE empresa_id=%s",
+            (empresa_id,)
+        )
+        return c.fetchall()
+    finally:
+        conn.close()
+
+
+def buscar_cliente_por_nif(nif, empresa_id):
+    if not nif:
+        return None
+    conn = get_db()
+    c = conn.cursor()
+    try:
+        c.execute("SELECT id FROM clientes WHERE nif=%s AND empresa_id=%s", (nif, empresa_id))
+        row = c.fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def obtener_consumo_facturas(empresa_id):
+    conn = get_db()
+    c = conn.cursor()
+    try:
+        c.execute("SELECT COUNT(*) FROM facturas WHERE empresa_id=%s", (empresa_id,))
+        return c.fetchone()[0]
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 7. ARRANQUE
+# ---------------------------------------------------------------------------
+
+def crear_tablas_iniciales():
+    """Inicializa la DB y crea la empresa demo si no existe."""
+    init_db()
+    conn = get_db()
+    c = conn.cursor()
+    try:
+        c.execute("SELECT COUNT(*) FROM empresas")
+        if c.fetchone()[0] == 0:
+            c.execute("""
+                INSERT INTO empresas (nombre, plan, max_logins, limite_facturas)
+                VALUES ('Empresa Demo', 'expert', 3, 5000)
+            """)
+        conn.commit()
+        _log.info("Tablas inicializadas y empresa demo verificada.")
+    except Exception as e:
+        _log.error(
+            "Error al crear tablas iniciales — probablemente faltan migraciones Alembic. "
+            "Ejecuta: alembic upgrade head. Detalle: %s", e
+        )
+    finally:
+        conn.close()
+
+# ---------------------------------------------------------------------------
+# 8. CORRECCIÓN Y APRENDIZAJE (EL SABUESO)
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 8. CORRECCIÓN Y APRENDIZAJE (EL SABUESO TÁCTICO - SOLO IMPORTES)
+# ---------------------------------------------------------------------------
+
+def corregir_importes_y_aprender(factura_id: int, cif_vendedor: str, 
+                                 nueva_base: float = 0.0, nuevo_iva: float = 0.0, nuevo_total: float = 0.0, 
+                                 nuevo_emisor: str = "", nuevo_cliente: str = "", 
+                                 nueva_fecha: str = "", nuevo_numero: str = "",
+                                 nombre_s3: str = None) -> bool:
+    try:
+        from sqlalchemy import text as sql_text
+        import json
+        import re
+        from core.logger import get_logger
+        _log = get_logger("iatlas.db")
+        
+        # --- 1. GUARDADO CONTABLE INMEDIATO ---
+        with engine.begin() as db:
+            # 1. Leemos el JSON actual de la factura para modificarlo
+            resultado = db.execute(sql_text("SELECT data FROM facturas WHERE id = :id"), {"id": factura_id}).fetchone()
+            
+            factura_data = {}
+            if resultado and resultado[0]:
+                factura_data = resultado[0] if isinstance(resultado[0], dict) else json.loads(resultado[0])
+            
+            # 2. Inyectamos los nuevos valores manuales en el diccionario
+            factura_data["base_imponible"] = nueva_base
+            factura_data["base"] = nueva_base
+            factura_data["iva_importe"] = nuevo_iva
+            factura_data["iva"] = nuevo_iva
+            factura_data["total_factura"] = nuevo_total
+            factura_data["total"] = nuevo_total
+            
+            if nuevo_emisor: 
+                factura_data["nombre_vendedor"] = nuevo_emisor
+                factura_data["emisor"] = nuevo_emisor
+            if nuevo_cliente: 
+                factura_data["nombre_cliente"] = nuevo_cliente
+                factura_data["cliente"] = nuevo_cliente
+            if nueva_fecha: 
+                factura_data["fecha"] = nueva_fecha
+            if nuevo_numero: 
+                factura_data["numero_factura"] = nuevo_numero
+            
+            # 3. ¡Destruimos el candado del OCR para que no vuelva a sobreescribir la interfaz!
+            factura_data.pop("_locked_fields", None)
+            
+            # 4. Guardamos las columnas relacionales Y el diccionario JSON limpio
+            db.execute(sql_text("""
+                UPDATE facturas 
+                SET base = :base, 
+                    iva = :iva, 
+                    total = :total, 
+                    data = :data_json,
+                    estado = 'completado', 
+                    metodo_extraccion = 'correccion_manual'
+                WHERE id = :id
+            """), {
+                "base": nueva_base, 
+                "iva": nuevo_iva, 
+                "total": nuevo_total, 
+                "data_json": json.dumps(factura_data),
+                "id": factura_id
+            })
+
+        # --- 2. EL SABUESO TÁCTICO ---
+        if nombre_s3 and cif_vendedor:
+            import tempfile
+            import os
+            from services.storage_service import descargar_pdf_de_s3
+            from core.ocr import obtener_texto_estructural
+            
+            ruta_tmp = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                    ruta_tmp = tmp.name
+                
+                if descargar_pdf_de_s3(nombre_s3, ruta_tmp):
+                    doc_struct = obtener_texto_estructural(ruta_tmp)
+                    
+                    if doc_struct:
+                        # 🧪 PREPARAMOS LOS VALORES A BUSCAR (Solo dineros)
+                        valores_a_buscar = {}
+                        if nueva_base: valores_a_buscar["base_imponible"] = nueva_base
+                        if nuevo_iva: valores_a_buscar["iva_importe"] = nuevo_iva
+                        if nuevo_total: valores_a_buscar["total_factura"] = nuevo_total
+
+                        plantilla_completa = {}
+                        campos_encontrados = 0
+
+                        # Buscador específico para importes
+                        def buscar_importe(importe_float):
+                            # Flexibilizamos la búsqueda para pillar "15,60", "15.60", etc.
+                            str_coma = f"{importe_float:.2f}".replace(".", ",")
+                            str_punto = f"{importe_float:.2f}"
+                            
+                            for idx_page, page in enumerate(doc_struct.pages):
+                                ancho_pag = getattr(page, 'width', 1000)
+                                alto_pag = getattr(page, 'height', 1000)
+                                
+                                for word in page.words:
+                                    # Limpiamos el texto del OCR de símbolos raros para comparar
+                                    txt_limpio = re.sub(r'[^\d,.-]', '', word.text)
+                                    if txt_limpio == str_coma or txt_limpio == str_punto:
+                                        x = getattr(word, 'x0', getattr(word.bbox[0] if hasattr(word, 'bbox') else word, 'x', 0.0))
+                                        y = getattr(word, 'y0', getattr(word.bbox[1] if hasattr(word, 'bbox') else word, 'y', 0.0))
+                                        w = getattr(word, 'width', getattr(word, 'w', word.x1 - word.x0 if hasattr(word, 'x1') else 0.0))
+                                        h = getattr(word, 'height', getattr(word, 'h', word.y1 - word.y0 if hasattr(word, 'y1') else 0.0))
+                                        
+                                        if x > 2 and ancho_pag > 0: 
+                                            x, y, w, h = x/ancho_pag, y/alto_pag, w/ancho_pag, h/alto_pag
+                                            
+                                        return {"x": x, "y": y, "width": w, "height": h, "pagina": idx_page}
+                            return None
+
+                        # 🧪 EJECUTAMOS LA BÚSQUEDA Y LOGUEAMOS
+                        for campo, importe in valores_a_buscar.items():
+                            _log.info(f"🧪 [SABUESO] Buscando {campo.upper()}: {importe}")
+                            coord = buscar_importe(importe)
+                            
+                            if coord:
+                                plantilla_completa[campo] = coord
+                                campos_encontrados += 1
+                                _log.info(f"✅ [BINGO] {campo.upper()} encontrado en x:{coord['x']:.2f}, y:{coord['y']:.2f}")
+                            else:
+                                _log.warning(f"❌ [SABUESO] No se encontró en el OCR el valor {importe} para {campo.upper()}")
+
+                        # --- GUARDADO ---
+                        if campos_encontrados > 0:
+                            # Sobrescribimos la plantilla antigua para evitar basura arrastrada
+                            with engine.begin() as db:
+                                db.execute(sql_text("DELETE FROM extractor_plantillas WHERE cif = :cif"), {"cif": cif_vendedor})
+                                
+                                # Guardamos con la estructura final que espera el lector
+                                plantilla_final = {"pagina": 0, "campos": plantilla_completa}
+                                db.execute(sql_text("""
+                                    INSERT INTO extractor_plantillas (cif, proveedor, json_campos, veces_usada)
+                                    VALUES (:cif, 'Autocura I.Atlas', :plantilla, 0)
+                                """), {"cif": cif_vendedor, "plantilla": json.dumps(plantilla_final)})
+                            _log.info(f"🧠 [APRENDIZAJE] Plantilla guardada con {campos_encontrados} campos numéricos.")
+
+            except Exception as e_ocr:
+                _log.error(f"❌ Error Sabueso: {e_ocr}")
+            finally:
+                if ruta_tmp and os.path.exists(ruta_tmp):
+                    os.unlink(ruta_tmp)
+
+        return True
+    except Exception as e:
+        _log.error(f"❌ Error crítico: {e}")
+        return False

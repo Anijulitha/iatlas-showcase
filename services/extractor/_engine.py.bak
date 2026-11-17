@@ -1,0 +1,2110 @@
+"""
+_engine.py — Motor principal de normalización y extracción por regex:
+sanear_resultado_ia, normalizar_fecha, normalizar_datos_factura,
+detectar_tipo_factura, segmentar_documento, _por_regex, limpiar_y_parsear_json.
+"""
+import re
+import json
+from decimal import Decimal
+from core.logger import get_logger
+from core.mutation_guard import set_field, clear_field
+from .pipeline.identity_candidates import classify_identity
+
+# 1. TODOS LOS IMPORTS NECESARIOS ARRIBA (Sin duplicados)
+try:
+    from core.normalizador_empresas import normalizar_nombre_emisor as _normalizar_emisor
+    _NORMALIZADOR = True
+except ImportError:
+    _NORMALIZADOR = False
+
+from ._constants import (RE_NIF_ES, RE_VAT_EXT, RE_IBAN, RE_CUPS, _RE_CODIGO_EN_CLIENTE, _RE_METADATO_EN_CLIENTE, _RE_BANCARIO_EN_CLIENTE, CIF_MAP)
+from ._helpers import (
+    limpiar_monto, money, limpiar_ibanes, es_identificador_fiscal,
+    es_linea_basura, es_nombre_empresa_pro, numero_valido, limpiar_numero_factura,
+    parece_fecha, validar_cuadre_contable, buscar_nombre_cerca_cif,
+    es_nombre_emisor_descartable
+)
+from services.schemas import coerce_to_canonical
+from services.extractor._strong_ocr import enforce_locked_fields
+from core.field_trace import record as _ftrace
+from ._extractors import (calcular_confianza, extraer_nombre_emisor_por_etiqueta, extraer_nombre_cliente_por_etiqueta, extraer_cif_cliente_por_etiqueta)
+from ._extractors import extraer_total_robusto
+from .pipeline.entidades import (
+    extraer_nombre_cabecera, 
+    extraer_total_por_regex, 
+    extraer_campo_por_linea, 
+    extraer_base_imponible
+)
+from .pipeline.financiera import reparar_desglose_financiero, sanear_magnitudes_crudas
+from .pipeline.resolver_final import resolve_legacy_invoice
+from .pipeline.utils import limpiar_y_parsear_json, segmentar_documento
+from .pipeline.templates import aplicar_plantilla, buscar_plantilla_en_db
+
+log = get_logger("iatlas.extractor")
+
+_MESES = {
+    'enero':1,'febrero':2,'marzo':3,'abril':4,'mayo':5,'junio':6,
+    'julio':7,'agosto':8,'septiembre':9,'octubre':10,'noviembre':11,'diciembre':12,
+    'january':1,'february':2,'march':3,'april':4,'may':5,'june':6,
+    'july':7,'august':8,'september':9,'october':10,'november':11,'december':12,
+}
+
+# --- VALIDADOR FISCAL ---
+def es_formato_fiscal_valido(texto):
+    if not texto: return False
+    
+    cif = re.sub(r'^(?:NIF|CIF|N\.I\.F\.|C\.I\.F\.)\s*:?\s*', '', texto.upper()).strip()
+    cif = re.sub(r'[\.\-\s]', '', cif)
+    
+    # 1. Lista negra: Si es una palabra prohibida, no es un CIF bajo ningún concepto
+    _PALABRAS_NO_CIF = {"CASTILLA", "SEVILLA", "MADRID", "ESPAÑA", "FACTURA", "TOTAL", "EMISOR"}
+    if cif in _PALABRAS_NO_CIF: return False
+
+    # 2. Intentamos validar con tu validador profesional
+    patron_fiscal = re.compile(r'^([ABCDEFGHJKLMNPQRSUVW]\d{7}[0-9A-J]|\d{8}[A-Z]|[XYZKLM]\d{7}[A-Z])$')
+    if patron_fiscal.match(cif):
+        try:
+            from services.validators.cif_validator import normalize_document_id
+            r = normalize_document_id(cif)
+            return r["valid"] or r["type"] in {"dni_es", "nie_es", "cif_es"}
+        except Exception:
+            return True
+
+    if 7 <= len(cif) <= 12:
+        numeros_en_cif = len(re.findall(r'\d', cif))
+        if numeros_en_cif >= 4:
+            return True
+        else:
+            return False
+
+# --- SANEAMIENTO ---
+def sanear_resultado_ia(data, cif_map=None): 
+    
+    log.critical("==================================================")
+    log.critical("🚨 DATOS CRUDOS DEL REGEX: %s", data)
+    log.critical("==================================================")
+    
+    if not isinstance(data, dict):
+        return data
+
+    # 👇 1. NUEVO: FILTRO ANTI-ALUCINACIONES 👇
+    for campo in ["emisor", "nombre_vendedor", "cliente", "nombre_cliente"]:
+        val = data.get(campo)
+        if val and isinstance(val, str):
+            # 💥 AÑADIDO: Matamos la palabra "FACTURA:" exacta
+            if re.search(r'(?i)(firmado\s+digital|signature|signed\s+by|@|correo\s+electr[oó]nico|^factura\s*:?$)', val.strip()):
+                data[campo] = ""
+            elif campo in ("emisor", "nombre_vendedor") and es_nombre_emisor_descartable(val):
+                data[campo] = ""
+
+    # 👇 2. NUEVO: SINCRONIZACIÓN DE NOMBRES 👇
+    if not data.get("emisor") and data.get("nombre_vendedor"):
+        data["emisor"] = data["nombre_vendedor"]
+    elif not data.get("nombre_vendedor") and data.get("emisor"):
+        data["nombre_vendedor"] = data["emisor"]
+
+    # ============================================================
+    # 3. SINCRONIZACIÓN NIF → CIF (Antes de la limpieza estricta)
+    # ============================================================
+    # Para personas físicas, el identificador puede llegar inicialmente
+    # como nif_emisor/nif_cliente. El resto del pipeline trabaja también
+    # con cif_vendedor/cif_cliente, así que no debemos perderlo.
+    if not data.get("cif_vendedor") and data.get("nif_emisor"):
+        data["cif_vendedor"] = data["nif_emisor"]
+    if not data.get("cif_cliente") and data.get("nif_cliente"):
+        data["cif_cliente"] = data["nif_cliente"]
+
+    log.critical("DEBUG: Versión de código 2026-06-12-V1") 
+    
+    bloque_texto = data.get("ocr_text", "")
+    
+    # 1. Regex de validación estricta
+    _RE_FORMATO_ESTRICTO = re.compile(r'^([ABCDEFGHJKLMNPQRSUVW]\d{7}[0-9A-J]|\d{8}[A-Z]|[XYZ]\d{7}[A-Z])$', re.I)
+    
+    # ------------------------------------------------------------------
+    # CAZADOR DE TOTALES (Inmune a basura de consumos o tablas)
+    # ------------------------------------------------------------------
+    # Buscamos la línea exacta, ignorando cualquier número que aparezca suelto en el texto
+    _patron_total_seguro = re.search(r'(?i)TOTAL\s+A\s+PAGAR[:\s€]*(\d{1,5}[\.,]\d{2})', bloque_texto)
+    if _patron_total_seguro:
+        _valor_cazado = float(_patron_total_seguro.group(1).replace(',', '.'))
+        data["total"] = _valor_cazado
+        data["confianza"] = 95
+        log.info("🛡️ [CAZADOR] Total capturado con precisión quirúrgica: %.2f€", _valor_cazado)
+
+    # 2. Limpieza y Normalización estricta de ambos campos
+    for campo_cif in ("cif_vendedor", "cif_cliente"):
+        val_raw = str(data.get(campo_cif) or "").strip().upper()
+        
+        # Normalizamos: quitamos puntos, guiones, espacios y prefijos
+        cif_limpio = re.sub(r'[\.\-\s]', '', val_raw)
+        cif_limpio = re.sub(r'^(?:NIF|CIF|N\.I\.F\.|C\.I\.F\.)\s*:?', '', cif_limpio).strip()
+        
+        # Si cumple formato, lo guardamos, si no, lo limpiamos
+        if _RE_FORMATO_ESTRICTO.match(cif_limpio):
+            data[campo_cif] = cif_limpio
+        elif RE_VAT_EXT.fullmatch(cif_limpio) and not cif_limpio.startswith("ES"):
+            data[campo_cif] = cif_limpio
+            
+        elif es_formato_fiscal_valido(cif_limpio): # 👈 EL SALVAVIDAS
+            data[campo_cif] = cif_limpio
+            log.info("🛡️ [SANEAR] NIF/CIF rescatado por regla de formato relajado: %s", cif_limpio)
+            
+        else:
+            if cif_limpio:
+                log.debug("[SANEAR] %s: '%s' (raw: '%s') no cumple formato estricto. Limpiando.", campo_cif, cif_limpio, val_raw)
+            data[campo_cif] = ""
+
+    # 3. NUEVO: Anclaje de roles por etiquetas fijas
+    # Esto ocurre ANTES de la protección de inversión de roles para que el sistema ya sepa la verdad
+    if "CLIENTE:" in bloque_texto.upper():
+        _match_cliente = re.search(r'CLIENTE:.*?(?:DNI/NIF\])?\s*([A-Z0-9]+)', bloque_texto, re.I)
+        if _match_cliente:
+            _cif_encontrado = _match_cliente.group(1).upper()
+            if _RE_FORMATO_ESTRICTO.match(_cif_encontrado):
+                data["cif_cliente"] = _cif_encontrado
+                log.info("⚓ [ANCLAJE] CIF Cliente fijado por etiqueta: %s", _cif_encontrado)
+
+    # 4. PROTECCIÓN: Evitamos inversión de roles (ya consolidada)
+    # La resolución de roles NO se hace aquí.
+    # sanear_resultado_ia() limpia formatos; el resolver de identidad
+    # decidirá posteriormente vendedor vs cliente.
+        
+    _TEXTO_BASURA_CLIENTE = re.compile(
+        r'(?i)(?:cuando\s+este\s+reciba|comunicaci[oó]n\s+fehaciente|'
+        r'art[ií]culo\s+\d|en\s+virtud\s+de|presente\s+contrato|'
+        r'conforme\s+a|seg[uú]n\s+lo\s+dispuesto)',
+        re.I
+    )
+
+    cliente_raw = str(data.get("nombre_cliente") or "")
+    if _TEXTO_BASURA_CLIENTE.search(cliente_raw):
+        log.debug("[SANEAR] nombre_cliente con texto legal, descartando.")
+        data["nombre_cliente"] = ""
+
+    nombre_vend = str(data.get("nombre_vendedor") or "").upper()
+    for nombre_clave, cif_real in cif_map.items():
+        if nombre_clave in nombre_vend:
+            if data.get("cif_vendedor") != cif_real:
+                log.debug("[SANEAR] %s: %s -> %s", nombre_clave, data.get("cif_vendedor"), cif_real)
+                data["cif_vendedor"] = cif_real
+            break
+        
+    cif_v = str(data.get("cif_vendedor") or "").strip().upper()
+    _CIF_PROTEGIDOS = set(cif_map.values())
+
+    # No decidimos aquí si un VAT español pertenece al cliente o al vendedor.
+    # El saneado conserva el identificador; el resolver de identidad asignará el rol.
+    if re.match(r'^[1-9]\d{7}[A-Z]$', cif_v) and cif_v not in _CIF_PROTEGIDOS:
+        cif_cli = str(data.get("cif_cliente") or "").strip().upper()
+        # La coincidencia vendedor/cliente se resuelve posteriormente.
+        # Aquí no destruimos ninguno de los dos identificadores.
+        if cif_cli and cif_v == cif_cli:
+            log.debug(
+                "[SANEAR] Coincidencia de identificadores detectada (%s); "
+                "se conserva para resolución posterior.",
+                cif_v,
+            )
+        else:
+            log.debug(
+                "[SANEAR] cif_vendedor '%s' es DNI — puede ser autónomo, conservando.",
+                cif_v,
+            )
+
+    cif_c = str(data.get("cif_cliente") or "").strip().upper()
+    if re.match(r'^ES\d{8}[A-Z]$', cif_c):
+        data["cif_cliente"] = cif_c[2:]
+        log.debug("[SANEAR] cif_cliente: prefijo ES eliminado -> %s", data["cif_cliente"])
+
+    cliente = str(data.get("nombre_cliente") or "")
+    if re.search(r'_{3,}|\.{5,}', cliente):
+        log.debug("[SANEAR] nombre_cliente parece formulario en blanco, descartando.")
+        data["nombre_cliente"] = ""
+    elif re.search(
+        r'(?i)(?:^y\s+apellidos|apellidos\s+del|dni\s+del\s+cliente|cif/nif|'
+        r'nombre\s+y\s+apellidos|razón\s+social|nombre\s+del\s+cliente|'
+        r'datos\s+del\s+cliente|nombre\s+completo)',
+        cliente
+    ):
+        log.debug("[SANEAR] nombre_cliente es placeholder de formulario, descartando.")
+        data["nombre_cliente"] = ""
+
+    nom_v = str(data.get("nombre_vendedor") or "").strip().upper()
+    nom_c = str(data.get("nombre_cliente")  or "").strip().upper()
+    cif_v = str(data.get("cif_vendedor")    or "").strip().upper()
+    cif_c = str(data.get("cif_cliente")     or "").strip().upper()
+
+    _mismo_nombre = nom_c and nom_v and (nom_c == nom_v or nom_c in nom_v or nom_v in nom_c)
+    _mismo_cif    = cif_c and cif_v and cif_c == cif_v
+    _cliente_es_pie_emisor = (
+        nom_c and nom_v and len(nom_v) >= 5
+        and (nom_v[:15] in nom_c or '|' in str(data.get("nombre_cliente", "")))
+    )
+    _palabras_vendedor = [w for w in nom_v.split() if len(w) > 4] if nom_v else []
+    _cliente_contiene_emisor = (
+        nom_c and _palabras_vendedor
+        and any(w in nom_c for w in _palabras_vendedor[:2])
+    )
+
+    # 🛑 CORTOCUITO DE IDENTIDAD (CORREGIDO)
+    _cliente_esta_bloqueado = data.get("_locked_fields", {}).get("nombre_cliente", {}).get("locked", False)
+    
+    # 1. Comprobamos la colisión
+    _colision_nombres = (str(data.get("emisor", "")).strip().upper() == 
+                         str(data.get("nombre_cliente", "")).strip().upper() and 
+                         data.get("nombre_cliente") != "")
+
+    if _colision_nombres:
+        log.debug(
+            "🛡️ [SANEAR] Colisión nominal detectada entre emisor y cliente; "
+            "se conserva para resolución posterior."
+        )
+
+    #if (_mismo_nombre or _mismo_cif or _cliente_es_pie_emisor or _cliente_contiene_emisor) and not _cliente_esta_bloqueado:
+        #log.debug("[SANEAR] cliente==vendedor o pie de emisor como cliente. Vaciando cliente.")
+        #data["nombre_cliente"] = ""
+        #data["cif_cliente"]    = ""
+    #else:
+        #if _cliente_esta_bloqueado:
+            #log.debug("[SANEAR] Se omitió el vaciado automático porque cif_cliente está BLINDADO por Strong OCR.")
+
+    if data.get("nombre_cliente"):
+        c = data["nombre_cliente"]
+        c = re.sub(r'^\[(?:Nombre|Cliente|Name|Titular|Razón\s+Social)\]\s*', '', c, flags=re.I)
+        c = re.sub(r'\b(BUY|PAYMENT|ORDER|CHECKOUT|INVOICE|RECEIPT)\b', '', c, flags=re.I)
+        c = re.split(
+            r'\s+(?:Subtotal|Subtotal\b|Spain\b|España\b|VAT\b|IVA\b|Total\b|'
+            r'Importe\b|Dirección\b|Address\b|Billing\b|Payment\b|'
+            r'Visa\b|Mastercard\b|IBAN\b|Andorra\b|Portugal\b|'
+            r'desde\b|marcando\b|llamando\b|gratuito\b|coste\b)',
+            c, flags=re.I
+        )[0].strip()
+        if len(c) > 20 and ' ' not in c:
+            log.debug("[SANEAR] nombre_cliente sin espacios — basura OCR, descartando.")
+            c = ''
+        c = re.sub(r'\s+\d+[,\.]\d+\s*€.*$', '', c).strip()
+        c = re.sub(r'\s+(?:CNAE|CUPS|REF|N[ºo°]|POL|PARC|C\.P\.?)\b.*$', '', c, flags=re.I)
+        if re.match(r'(?i)^(?:factura\s+original|referencia|ref\.?|n[uú]mero|order|pedido)\s*:', c):
+            log.debug("[SANEAR] nombre_cliente es referencia de factura, descartando.")
+            c = ""
+        if c and _RE_CODIGO_EN_CLIENTE.match(c):
+            log.debug("[SANEAR] nombre_cliente parece código/número, no un nombre: '%s'", c)
+            c = ""
+        palabras = c.split()
+        mitad = len(palabras) // 2
+        if mitad >= 2 and palabras[:mitad] == palabras[mitad:mitad*2]:
+            c = " ".join(palabras[:mitad])
+        palabras_limpias = c.split()
+        if len(palabras_limpias) > 5:
+            primeras = palabras_limpias[:3]
+            if all(p[0].isupper() for p in primeras if p):
+                c = " ".join(palabras_limpias[:4])
+                log.debug("[SANEAR] nombre_cliente truncado a 4 palabras: '%s'", c)
+        data["nombre_cliente"] = c.strip() or ""
+        
+        BASURA_CLIENTE = {
+            "cliente", "del cliente", "nombre del cliente", 
+            "facturado a", "destinatario", "receptor"
+        }
+        if data["nombre_cliente"].lower() in BASURA_CLIENTE:
+            log.warning("🧹 [PURGA] Limpiando falso cliente '%s' para permitir rescate espacial.", data["nombre_cliente"])
+            data["nombre_cliente"] = ""
+
+    #cif_cli_check = str(data.get("cif_cliente") or "").strip().upper()
+    # Fíjate en los paréntesis () al final del nombre de la función:
+    #if cif_cli_check and not es_formato_fiscal_valido(cif_cli_check):
+        #log.debug("[SANEAR] cif_cliente '%s' no es identificador fiscal válido, descartando.", cif_cli_check)
+        #data["cif_cliente"] = ""
+
+    nombre_vend_raw = str(data.get("nombre_vendedor") or "")
+    nombre_vend_raw = re.sub(
+        r'(?i)^Nombre\s+del\s+Negocio\s*:\s*',
+        '',
+        nombre_vend_raw
+    ).strip()
+
+    if nombre_vend_raw:
+        data["nombre_vendedor"] = nombre_vend_raw
+    _vend_cleaned = re.sub(
+        r'\b(?:N\.?I\.?F\.?|C\.?I\.?F\.?|DNI|VAT)(?:[/\s]?(?:NIF|CIF|DNI))?[:\s]*',
+        ' ', nombre_vend_raw, flags=re.I,
+    )
+    _vend_cleaned = re.sub(r'\b\d{2}[\.\s\-]?\d{3}[\.\s\-]?\d{3}[\s\-]*[A-Z]?\b', '', _vend_cleaned)
+    _vend_cleaned = re.sub(r'\s+', ' ', _vend_cleaned).strip()
+    if _vend_cleaned != nombre_vend_raw and len(_vend_cleaned) >= 3:
+        log.debug("[SANEAR] nombre_vendedor tokens OCR eliminados: '%s'", nombre_vend_raw[:60])
+        data["nombre_vendedor"] = _vend_cleaned
+        nombre_vend_raw = _vend_cleaned
+
+    _es_basura_nombre = any([
+        bool(re.match(r'(?i)^(?:hola|gracias|estimad[oa]|querid[oa]|dear|hi|hello)\b', nombre_vend_raw)),
+        re.search(r"(?i)(?:EMPRESA\s*[:—]\s*[A-Z0-9]+|CLIENTE\s*[:—]\s*[A-Z0-9]+)", nombre_vend_raw),
+        re.search(r"(?i)(?:NIF|CIF)\s+[A-Z0-9]{7,12}\s*[—\-]", nombre_vend_raw),
+        re.search(r"(?i)Código\s+IVA\s+[A-Z0-9]{7,12}", nombre_vend_raw),
+        re.search(r"(?i)\bCNAE\b", nombre_vend_raw),
+        re.search(r"(?i)^(?:Negocio|Sector|Categoría|Tipo|Actividad)[:\s]", nombre_vend_raw),
+        re.search(r"(?i)^(?:www\.|http)", nombre_vend_raw),
+        bool(re.search(r"\d{4,}", nombre_vend_raw)),
+        len(nombre_vend_raw) > 60 and nombre_vend_raw.count("—") >= 2,
+    ])
+    
+    log.critical(
+        "🧪 [BASURA DEBUG] nombre=%r | basura=%s | "
+        "hola=%s | empresa_cliente=%s | nifcif=%s | codigo_iva=%s | cnae=%s | "
+        "negocio_sector=%s | url=%s | digitos4=%s | largo_guiones=%s",
+        nombre_vend_raw,
+        _es_basura_nombre,
+        bool(re.match(r'(?i)^(?:hola|gracias|estimad[oa]|querid[oa]|dear|hi|hello)\b', nombre_vend_raw)),
+        bool(re.search(r"(?i)(?:EMPRESA\s*[:—]\s*[A-Z0-9]+|CLIENTE\s*[:—]\s*[A-Z0-9]+)", nombre_vend_raw)),
+        bool(re.search(r"(?i)(?:NIF|CIF)\s+[A-Z0-9]{7,12}\s*[—\-]", nombre_vend_raw)),
+        bool(re.search(r"(?i)Código\s+IVA\s+[A-Z0-9]{7,12}", nombre_vend_raw)),
+        bool(re.search(r"(?i)\bCNAE\b", nombre_vend_raw)),
+        bool(re.search(r"(?i)^(?:Negocio|Sector|Categoría|Tipo|Actividad)[:\s]", nombre_vend_raw)),
+        bool(re.search(r"(?i)^(?:www\.|http)", nombre_vend_raw)),
+        bool(re.search(r"\d{4,}", nombre_vend_raw)),
+        bool(len(nombre_vend_raw) > 60 and nombre_vend_raw.count("—") >= 2),
+    )
+    
+    if _es_basura_nombre:
+        log.debug("[SANEAR] nombre_vendedor con basura OCR, limpiando.")
+        data["nombre_vendedor"] = ""
+
+    nombre_cli_raw = str(data.get("nombre_cliente") or "")
+    _cli_cleaned = re.sub(
+        r'\b(?:N\.?I\.?F\.?|C\.?I\.?F\.?|DNI|VAT)(?:[/\s]?(?:NIF|CIF|DNI))?[:\s]*',
+        ' ', nombre_cli_raw, flags=re.I,
+    )
+    _cli_cleaned = re.sub(r'\b\d{2}[\.\s\-]?\d{3}[\.\s\-]?\d{3}[\s\-]*[A-Z]?\b', '', _cli_cleaned)
+    _cli_cleaned = re.sub(r'\s+', ' ', _cli_cleaned).strip()
+    if _cli_cleaned != nombre_cli_raw and len(_cli_cleaned) >= 3:
+        log.debug("[SANEAR] nombre_cliente tokens OCR eliminados: '%s'", nombre_cli_raw[:60])
+        data["nombre_cliente"] = _cli_cleaned
+        nombre_cli_raw = _cli_cleaned
+
+    _es_basura_cliente = any([
+        re.search(r"(?i)^(?:www\.|http|factura\s+original|factura\s+ref|factura\s+n)", nombre_cli_raw),
+        re.search(r"(?i)^(?:referencia|ref\.?)[:\s]", nombre_cli_raw),
+        re.search(r"(?i)(?:Pág\.\s*\d|Page\s*\d|\x0c)", nombre_cli_raw),
+        re.search(r"(?i)(?:se\s+atender[aá]|lo\s+que\s+se|establecido\s+en|obligación\s+de)", nombre_cli_raw),
+        re.search(r"[A-Z]{2}\d{10,}", nombre_cli_raw),
+        re.search(r"(?i)^/Asociado", nombre_cli_raw),
+        '|' in nombre_cli_raw and len(nombre_cli_raw) > 30,
+        len(nombre_cli_raw) > 60 and bool(re.search(r"\d{6,}", nombre_cli_raw)),
+        bool(_RE_METADATO_EN_CLIENTE.search(nombre_cli_raw)),
+    ])
+    if _es_basura_cliente:
+        log.debug("[SANEAR] nombre_cliente descartado (metadato/etiqueta): '%s'", nombre_cli_raw[:60])
+        data["nombre_cliente"] = ""
+
+    cif_raw    = str(data.get("cif_vendedor") or "").strip().upper()
+    nombre_raw = str(data.get("nombre_vendedor") or "")
+
+    if _NORMALIZADOR:
+        log.critical(
+            "🧨 [NORMALIZADOR INPUT] nombre_raw=%r | cif_raw=%r",
+            nombre_raw,
+            cif_raw,
+        )
+
+        nombre_final, cif_final = _normalizar_emisor(nombre_raw, cif_raw)
+
+        log.critical(
+            "🧨 [NORMALIZADOR OUTPUT] nombre_final=%r | cif_final=%r",
+            nombre_final,
+            cif_final,
+        )
+        if nombre_final != nombre_raw:
+            log.debug("[SANEAR] Nombre canónico: '%s' (era: '%s')", nombre_final, nombre_raw[:40])
+        data["nombre_vendedor"] = nombre_final
+        
+        log.critical(
+            "🧨 [NORMALIZADOR WRITE] nombre_vendedor AHORA=%r",
+            data.get("nombre_vendedor"),
+        )
+        
+        if cif_final and not cif_raw:
+            data["cif_vendedor"] = cif_final
+    else:
+        cif_final = cif_raw
+        from core.normalizador_empresas import NOMBRES_CANONICOS
+        if cif_final in NOMBRES_CANONICOS:
+            data["nombre_vendedor"] = NOMBRES_CANONICOS[cif_final]
+            log.debug("[SANEAR] Nombre canónico forzado: '%s'", NOMBRES_CANONICOS[cif_final])
+            
+    # =======================================================================
+    # 🛡️ PROTECCIÓN DE MAGNITUDES (Aquí va el bloque por el que preguntas)
+    # =======================================================================
+    # NO TOCAR DATOS SI EL PARSER ES PERFECTO
+    if data.get("metodo_extraccion") and "parser" in data.get("metodo_extraccion"):
+        log.info("🛡️ [INMUNIDAD] Datos validados por Parser. Saltando correcciones matemáticas.")
+    else:
+        # Aquí ejecutas tus limpiezas matemáticas solo si NO es un parser
+        sanear_magnitudes_crudas(data)
+
+    # ¡ESTO ES VITAL! Aquí termina sanear_resultado_ia devolviendo el diccionario
+    return data
+
+
+
+def normalizar_fecha(f):
+    if not f:
+        return None
+    f = str(f).strip()
+
+    m = re.match(r'^(\d{1,2})/(\d{1,2})/(\d{4})$', f)
+    if m:
+        anio = int(m.group(3))
+        if 2000 <= anio <= 2099:
+            return f"{m.group(1).zfill(2)}/{m.group(2).zfill(2)}/{m.group(3)}"
+        return None
+
+    m = re.match(r'^(\d{1,2})/(\d{1,2})/(\d{2})$', f)
+    if m:
+        anio = 2000 + int(m.group(3))
+        if 2000 <= anio <= 2099:
+            return f"{m.group(1).zfill(2)}/{m.group(2).zfill(2)}/{anio}"
+        return None
+
+    m = re.match(r'^(\d{1,2})[-.](\d{1,2})[-.](\d{4})$', f)
+    if m:
+        anio = int(m.group(3))
+        if 2000 <= anio <= 2099:
+            return f"{m.group(1).zfill(2)}/{m.group(2).zfill(2)}/{m.group(3)}"
+        return None
+
+    m = re.match(r'^(\d{1,2})\s+([a-záéíóúñA-Z]+)\s+(\d{4})$', f, re.I)
+    if m:
+        mes_num = _MESES.get(m.group(2).lower())
+        anio = int(m.group(3))
+        if mes_num and 2000 <= anio <= 2099:
+            return f"{m.group(1).zfill(2)}/{str(mes_num).zfill(2)}/{m.group(3)}"
+        return None
+
+    m = re.match(r'^(\d{4})-(\d{2})-(\d{2})$', f)
+    if m:
+        anio = int(m.group(1))
+        if 2000 <= anio <= 2099:
+            return f"{m.group(3)}/{m.group(2)}/{m.group(1)}"
+        return None
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# NORMALIZACIÓN DE DATOS DE FACTURA
+# ---------------------------------------------------------------------------
+    
+def detectar_si_es_marketplace(bloque_texto):    
+    """Detecta si estamos ante una factura de Marketplace (Amazon, AliExpress) con vendedor externo."""
+    _txt = bloque_texto.upper()
+    return any(k in _txt for k in ["VENDIDO POR", "MARKETPLACE", "SHENZHEN", "VENDEDOR EXTERNO"])
+
+def resolver_inconsistencias_contables(data: dict) -> bool:
+    """
+    Función pura de reparación contable. Modifica data y marca math_corrected=True
+    si detecta una discrepancia matemática que puede resolverse sin ambigüedad.
+    """
+    _base = money(data.get("base_imponible") or data.get("base") or 0)
+    _iva = money(data.get("iva_importe") or data.get("iva") or 0)
+    _irpf = money(data.get("importe_irpf") or data.get("irpf") or 0)
+    _total = money(data.get("total_factura") or data.get("total") or 0)
+    
+    return False
+
+def _trace_cif_vendedor(data, value, origen):
+    log.critical(
+        "🚨 [CIF_VENDEDOR TRACE] origen=%s | valor=%r | anterior=%r",
+        origen,
+        value,
+        data.get("cif_vendedor"),
+    )
+
+def _es_cif_vendedor_valido_y_no_cliente(cif: str, cif_cliente: str) -> bool:
+    """
+    Valida de forma estricta que el CIF candidato a vendedor cumpla formato fiscal
+    y no colisione con el NIF/CIF del cliente o sea un código basura (ej. referencias de factura).
+    """
+    if not cif:
+        return False
+    
+    cif_up = str(cif).strip().upper()
+    cli_up = str(cif_cliente or "").strip().upper()
+
+    # 1. No puede ser igual al cliente
+    if cli_up and cif_up == cli_up:
+        return False
+
+    # 2. No puede ser el NIF propietario del workspace si actúa como cliente
+    if cif_up == "34076486P":
+        return False
+
+    # 3. Debe pasar el test de formato fiscal estricto o relajado seguro
+    if not es_formato_fiscal_valido(cif_up):
+        return False
+
+    if cif_up.startswith("K") and len(cif_up) > 8 and not re.fullmatch(r'^K\d{7}[A-Z]$', cif_up):
+        return False
+
+    return True
+
+# ---------------------------------------------------------------------------
+# HELPERS / VALIDADORES
+# ---------------------------------------------------------------------------
+
+def reconstruir_identificador_fiscal_desde_ocr(valor_ia, bloque_texto):
+    """
+    Reconstruye un NIF/CIF parcial proporcionado por la IA usando
+    únicamente identificadores fiscales completos presentes en el OCR.
+
+    Ejemplos:
+        '34.076.486' + '34076486P'  -> '34076486P'
+        '34.076.486' + '34.076.486 -P' -> '34076486P'
+        '8753928' + 'B87539284' -> 'B87539284'
+
+    Si no existe una coincidencia inequívoca, devuelve "".
+    """
+    
+    from services.extractor.pipeline.identity_candidates import classify_identity
+
+    valor_ia = str(valor_ia or "").strip().upper()
+    texto = str(bloque_texto or "")
+
+    if not valor_ia or not texto:
+        return ""
+
+    if classify_identity(valor_ia) == "vat_eu":
+        return valor_ia
+
+    parcial = re.sub(r"[^A-Z0-9]", "", valor_ia)
+
+    if not parcial:
+        return ""
+
+    # ---------------------------------------------------------------
+    # 1. Identificadores fiscales detectados normalmente por RE_NIF_ES
+    # ---------------------------------------------------------------
+    candidatos = []
+
+    for match in RE_NIF_ES.finditer(texto):
+        candidato = re.sub(
+            r"[^A-Z0-9]",
+            "",
+            match.group()
+        ).upper()
+
+        if not candidato:
+            continue
+
+        if not es_formato_fiscal_valido(candidato):
+            continue
+
+        candidatos.append(candidato)
+
+    # ---------------------------------------------------------------
+    # 2. Fallback para OCR fragmentado
+    #
+    # Ejemplo:
+    #     "NIF/CIF: 34.076.486 -P"
+    #
+    # RE_NIF_ES no detecta esto como un único NIF, así que
+    # reconstruimos específicamente el patrón DNI fragmentado.
+    # ---------------------------------------------------------------
+    _patron_dni_fragmentado = re.compile(
+        r"(?<!\d)"
+        r"(\d{2}[.\s-]?\d{3}[.\s-]?\d{3})"
+        r"\s*[-]?\s*"
+        r"([A-Z])"
+        r"(?![A-Z0-9])",
+        re.I,
+    )
+
+    for match in _patron_dni_fragmentado.finditer(texto):
+        candidato = (
+            re.sub(r"\D", "", match.group(1))
+            + match.group(2).upper()
+        )
+
+        if es_formato_fiscal_valido(candidato):
+            candidatos.append(candidato)
+
+    # Eliminar duplicados manteniendo orden.
+    candidatos = list(dict.fromkeys(candidatos))
+
+    # ---------------------------------------------------------------
+    # 3. Comparar IA contra los candidatos completos del OCR
+    # ---------------------------------------------------------------
+    coincidencias = []
+
+    for candidato in candidatos:
+
+        # Caso normal: la IA ha perdido formato/puntuación.
+        if parcial == candidato:
+            coincidencias.append(candidato)
+            continue
+
+        parcial_digitos = re.sub(r"\D", "", parcial)
+        candidato_digitos = re.sub(r"\D", "", candidato)
+
+        if not parcial_digitos:
+            continue
+
+        # DNI: IA devuelve los 8 dígitos y OCR aporta la letra.
+        if len(parcial_digitos) == 8:
+            if candidato_digitos == parcial_digitos:
+                coincidencias.append(candidato)
+                continue
+
+        # CIF parcial: IA devuelve 7 dígitos y OCR tiene
+        # letra + 7 dígitos + dígito de control.
+        if len(parcial_digitos) == 7:
+            if candidato_digitos.startswith(parcial_digitos):
+                coincidencias.append(candidato)
+                continue
+
+    coincidencias = list(dict.fromkeys(coincidencias))
+
+    # ---------------------------------------------------------------
+    # 4. Solo reconstruimos si existe una coincidencia inequívoca
+    # ---------------------------------------------------------------
+    if len(coincidencias) == 1:
+        return coincidencias[0]
+
+    return ""
+
+def normalizar_datos_factura(data, metodo="ia", bloque_texto=""):
+    # --- FLUJO DE ARQUITECTURA SANEADA ---
+    limpiar_extracciones_erroneas(data, bloque_texto)
+    data = reparar_desglose_financiero(data)
+    ejecutar_validaciones(data)
+
+    # 🧩 RECONSTRUCCIÓN FISCAL DESDE OCR
+    _cif_in = str(data.get("cif_vendedor") or "").strip().upper()
+    _cif_cliente_actual = str(data.get("cif_cliente") or "").strip().upper()
+
+    if _cif_in and _cif_in != _cif_cliente_actual:
+        # 🛡️ VAT EUROPEO VÁLIDO: no reconstruir como NIF/CIF español
+        if classify_identity(_cif_in) == "vat_eu":
+            log.info(
+                "🛡️ [ADUANA FISCAL] VAT europeo válido preservado: '%s'",
+                _cif_in,
+            )
+        else:
+            _cif_reconstruido = reconstruir_identificador_fiscal_desde_ocr(
+                _cif_in,
+                bloque_texto,
+            )
+
+            if _cif_reconstruido:
+                log.info(
+                    "🧩 [CIF RECONSTRUCTION] IA='%s' + OCR -> '%s'",
+                    _cif_in,
+                    _cif_reconstruido,
+                )
+                data["cif_vendedor"] = _cif_reconstruido
+                data["_cif_vendedor_reconstruido_ocr"] = True
+            else:
+                _cif_limpio = re.sub(r"[^A-Z0-9]", "", _cif_in)
+
+                _patron_fiscal_completo = re.compile(
+                    r"^(?:"
+                    r"[ABCDEFGHJKLMNPQRSUVW]\d{7}[0-9A-J]"
+                    r"|\d{8}[A-Z]"
+                    r"|[XYZ]\d{7}[A-Z]"
+                    r")$"
+                )
+
+                if not _patron_fiscal_completo.fullmatch(_cif_limpio):
+                    log.warning(
+                        "🚨 [ADUANA FISCAL] Identificador incompleto "
+                        "sin reconstrucción OCR: '%s'",
+                        _cif_in,
+                    )
+                    data["cif_vendedor"] = ""
+
+    total_raw = data.get("total") or data.get("total_factura") or "0"
+
+    log.critical("==================================================")
+    log.critical("ID DATA DENTRO DE NORMALIZADOR=%s", id(data))
+    log.critical("DATA DENTRO DE NORMALIZADOR=%s", data)
+    log.critical("==================================================")
+
+    # =================================================================
+    # 🛡️ LECTURA SEGURA: PRIORIDAD A LOS LOCKS (Mata-Alias)
+    # Si un alias está bloqueado por OCR, gana la partida automáticamente.
+    # =================================================================
+    _locked = data.get("_locked_fields") or {}
+    def _get_locked_or_best(*fields):
+        # 1. Buscamos si alguno de los alias está bloqueado por Strong OCR
+        for f in fields:
+            if isinstance(_locked.get(f), dict) and _locked[f].get("locked"):
+                return _locked[f]["value"]
+        # 2. Si ninguno está bloqueado, cogemos el primero que tenga valor
+        for f in fields:
+            if data.get(f) not in (None, "", "None"):
+                return data[f]
+        return 0.0
+
+    total_raw = str(_get_locked_or_best("total", "total_factura"))
+    base = limpiar_monto(_get_locked_or_best("base", "base_imponible"))
+    irpf = limpiar_monto(_get_locked_or_best("irpf", "importe_irpf"))
+    
+    # 🚨 SEPARACIÓN ESTRICTA: iva_importe es DINERO, iva es PORCENTAJE
+    iva_importe_val = limpiar_monto(_get_locked_or_best("iva_importe"))
+    iva_pct_val = limpiar_monto(_get_locked_or_best("iva"))
+    
+    exento = limpiar_monto(data.get("exento") or 0.0)
+
+    # 1. ANCLAJE DE DATOS (Force-Binding)
+    if data.get("nif_cliente"):
+        data["cif_cliente"] = data["nif_cliente"]
+        
+    # 2. BYPASS RADICAL (Agua)
+    if "CICLO INTEGRAL DEL AGUA" in bloque_texto.upper() or "EMASESA" in bloque_texto.upper():
+        log.critical(
+            "💧 [BYPASS AGUA] Detectada factura de agua."
+        )
+
+        data["nombre_vendedor"] = "EMASESA Metropolitana"
+
+        # NO pisar un CIF obtenido por OCR/regex/locks.
+        # Solo usar el CIF canónico si todavía no tenemos uno.
+        if not data.get("cif_vendedor"):
+            #data["cif_vendedor"] = "28829809E"
+            log.critical(
+                "💧 [BYPASS AGUA] CIF EMASESA asignado por fallback canónico: 28829809E"
+            )
+            
+        # 🛡️ EMASESA: identidad canónica
+        if (
+            "EMASESA" in bloque_texto.upper()
+            and data.get("nombre_vendedor") == "EMASESA Metropolitana"
+        ):
+            _cif_antes = str(data.get("cif_vendedor") or "").strip().upper()
+
+            if not _cif_antes:
+                #data["cif_vendedor"] = "28829809E"
+                log.critical(
+                    "💧 [EMASESA CANÓNICO] Sin CIF previo → 28829809E"
+                )    
+
+    # 3. PROTECCIÓN DE INVERSIÓN (Resolución por linaje)
+    cif_v = data.get("cif_vendedor")
+    cif_c = data.get("cif_cliente")
+    
+    if cif_v and cif_v == cif_c:
+        locks = data.get("_locked_fields", {})
+        src_v = locks.get("cif_vendedor", {}).get("source", "") if isinstance(locks, dict) else ""
+        src_c = locks.get("cif_cliente", {}).get("source", "") if isinstance(locks, dict) else ""
+        
+        # Jerarquía de fiabilidad (puedes ampliarla)
+        fuentes_oro = {"current_valid_ocr", "explicit_label", "ocr_exact_label", "ocr_invoice_header"}
+        
+        v_fiable = src_v in fuentes_oro
+        c_fiable = src_c in fuentes_oro
+        
+        if v_fiable and not c_fiable:
+            log.warning("🛡️ [PROTECCIÓN] CIF Vendedor (%s) > Cliente (%s). Borrando Cliente alucinado.", src_v, src_c)
+            data["cif_cliente"] = ""
+        elif c_fiable and not v_fiable:
+            log.warning("🛡️ [PROTECCIÓN] CIF Cliente (%s) > Vendedor (%s). Borrando Vendedor alucinado.", src_c, src_v)
+            data["cif_vendedor"] = ""
+        else:
+            # Empate: Por estadística, el OCR suele duplicar el vendedor hacia abajo.
+            log.warning("🛡️ [PROTECCIÓN] Empate de fuentes (%s). Borrando Cliente por precaución.", src_v)
+            data["cif_cliente"] = ""
+            
+    def _num_or_zero(value):
+        try:
+            if value is None or value == "":
+                return 0.0
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0        
+        
+    # --- DESINFECCIÓN STRUCTURAL DE LITERATURA LEGAL Y CONDICIONES ---
+    _EMISORES_BASURA = [
+        "TU HISTORIAL DE CONSUMO", "SUITE ", "DIRECCIÓN DE FACTURACIÓN", 
+        "UDS PRECIO", "CANTIDAD", "DESCRIPCIÓN", "HISTORIAL DE CONSUMO",
+        "NEGOCIO: REAL ESTATE"
+    ]
+    if bloque_texto:
+        _kw_basura_legal = [
+            r'(?i)condiciones\s+generales',
+            r'(?i)aviso\s+de\s+confidencialidad',
+            r'(?i)reglamento\s+(?:ue|europeo)',
+            r'(?i)orden\s+de\s+reparaci[oó]n',
+            r'(?i)el\s+taller\s+eurorepar',
+            r'(?i)cl[aá]usulas\s+de\s+facturaci[oó]n'
+        ]
+        # 1. Limpieza de basura (tu código existente)
+        for _kw in _kw_basura_legal:
+            _match_legal = re.search(_kw, bloque_texto)
+            if _match_legal:
+                bloque_texto = bloque_texto[:_match_legal.start()]
+                break    
+
+        # 2. BLOQUEO RÍGIDO (parser dedicado)
+        _lineas_con_total = [l for l in bloque_texto.split('\n') if "TOTAL FACTURA" in l.upper() or "TOTAL A PAGAR" in l.upper()]
+        
+        # Añadimos una bandera para saber que hemos bloqueado la IA
+        IA_BLOQUEADA = False
+        if _lineas_con_total:
+            IA_BLOQUEADA = True
+            log.info("🔒 [PARSER RÍGIDO] Encontrado total explícito. IA Bloqueada.")
+            # Opcional: extrae el total aquí mismo con una regex rápida y no le des oportunidad a la IA       
+            
+        # 3. Cálculo del total
+        if IA_BLOQUEADA:
+            # Extraemos el total solo mediante Regex, sin usar la lógica de inferencia inferior
+            total = extraer_total_por_regex(bloque_texto) 
+        else:
+            # Aquí dejas tu lógica original de cálculo
+            total = limpiar_monto(total_raw) if total_raw else round(...)    
+
+    # 2. Extraer montos (Unificación)
+    # Primera pasada del resolver por candidatos: rellena vacios derivados
+    # (p. ej. base = total - iva_importe) sin pisar campos ya extraidos.
+    resolve_legacy_invoice(data, mark_conflicts=False)
+
+    _src_base_explicita = data.get("_src_base") == "explicit_label" and data.get("base_imponible")
+    _src_iva_explicita = (
+        data.get("_src_iva") == "explicit_label"
+        and data.get("iva_importe") is not None
+        and str(data.get("iva_importe", "")).strip() != ""
+    )
+    if _src_base_explicita:
+        base = limpiar_monto(data["base_imponible"])
+    else:
+        base = limpiar_monto(data.get("base") or data.get("base_imponible") or 0.0)
+
+    # 🔴 SEPARACIÓN: iva_importe_val representa DINERO, iva_pct_val representa PORCENTAJE
+    if _src_iva_explicita:
+        iva_importe_val = limpiar_monto(data["iva_importe"])
+    else:
+        iva_importe_val = limpiar_monto(data.get("iva_importe") or 0.0)
+
+    iva_pct_val = limpiar_monto(data.get("iva") or 0.0)
+
+    # Red de seguridad: si el porcentaje es un disparate y cuadra como importe respecto a la base, se mueve
+    if iva_pct_val > 50 and base > 0:
+        _tipo = iva_pct_val / base
+        if 0 < _tipo <= 1:
+            log.warning("🧮 [MATH FIX] IVA '%s' parece importe, no porcentaje. Trasladando a iva_importe.", iva_pct_val)
+            iva_importe_val = iva_pct_val
+            iva_pct_val = 0.0
+
+    irpf   = limpiar_monto(data.get("irpf") or data.get("importe_irpf") or 0.0)
+    exento = limpiar_monto(data.get("exento") or data.get("importe_exento") or 0.0)
+    total_raw = data.get("total") or data.get("total_factura")
+    total = limpiar_monto(total_raw) if total_raw else round(float(base) + float(iva_importe_val) + float(exento) - abs(float(irpf)), 2)
+
+    if iva_importe_val < 0:
+        log.warning("[IVA SANIDAD] IVA negativo %.2f → usando valor absoluto", iva_importe_val)
+        iva_importe_val = abs(iva_importe_val)
+        
+    if base > total and total > 0:
+        log.warning("[MAGNITUD] base=%.2f > total=%.2f — Conservando base y marcando inconsistencia", base, total)
+        data["math_inconsistencia"] = True
+
+    _total_src = data.get("_src_total", "")
+    _total_bloqueado = data.get("_locked_fields", {}).get("total", {}).get("locked", False)
+    _fuentes_intocables = ["explicit_label", "ocr_explicit_label", "template_deterministic", "regex_robusto"]
+    
+    # 🛡️ LEY MARCIAL: Si está bloqueado o viene de fuente explícita, el heurístico no se ejecuta.
+    if (total > 0 and bloque_texto 
+            and _total_src not in _fuentes_intocables 
+            and not _total_bloqueado
+            and not (data.get("_es_factura_internacional") or False)):
+        _mejores_totales_txt: list[float] = []
+        for _tc_m in re.finditer(
+            r'(?i)(?:total|importe|pagar|satisfacer|cobrar|factura)\b[^\d]{0,30}(\d{1,6}[,\.]\d{2})',
+            bloque_texto
+        ):
+            _val_tc = float(limpiar_monto(_tc_m.group(1)))
+            if _val_tc > float(total) * 1.10:
+                _mejores_totales_txt.append(_val_tc)
+        if _mejores_totales_txt:
+            _total_correcto = max(_mejores_totales_txt)
+            log.warning(
+                "[TOTAL_BAJO] total=%.2f < %.2f etiquetado en texto → "
+                "corrigiendo total (posible alucinación LLM o sub-importe elegido por regex)",
+                float(total), _total_correcto,
+            )
+            total = limpiar_monto(str(_total_correcto))
+
+    _source: dict[str, str] = {}
+    if base  != 0: _source["base_imponible"] = data.get("_src_base",  "regex_heuristic")
+    if iva_importe_val != 0: _source["iva_importe"] = data.get("_src_iva", "regex_heuristic")
+    if irpf  != 0: _source["irpf"]           = data.get("_src_irpf",  "regex_heuristic")
+    if total != 0: _source["total"]          = data.get("_src_total", "regex_heuristic")
+
+    if (float(base) > 0 and float(total) > 0
+            and float(base) == int(float(base)) and float(base) <= 100
+            and float(total) > float(base) + float(iva_importe_val)
+            and abs(float(base) + float(iva_importe_val) - abs(float(irpf)) - float(total)) > float(total) * 0.50):
+        log.warning(
+            "[BASE_SUSPECT] base=%.0f (entero ≤ 100, diff > 50%% total %.2f) — "
+            "posible columna unidades → zerificando",
+            float(base), float(total),
+        )
+        #base = limpiar_monto(0)
+        _source.pop("base_imponible", None)
+
+    if bloque_texto and ',' not in bloque_texto and float(base) > 0 and float(total) < float(base) * 0.8:
+        _miles_in_doc = re.findall(r'\b\d{1,3}(?:\.\d{3})+\b', bloque_texto)
+        for _m in sorted(_miles_in_doc, key=lambda x: float(money(x)), reverse=True):
+            _cand = float(money(_m))
+            if _cand >= float(base) and abs(_cand - float(base) - float(iva_importe_val)) <= 0.10:
+                log.debug("[MONEY CTX] no-coma doc: total %.4f → %.2f (miles '%s' en texto)", total, _cand, _m)
+                total = _cand
+                break
+
+    _cif_raw_early = str(data.get("cif_vendedor") or "").strip().upper()
+    _es_eu_cif = bool(re.match(
+        r'^(?:IE|LU|FR|DE|NL|PT|IT|BE|AT|PL|SE|DK|FI|CZ|HU|RO|SK|SI|EE|LV|LT|HR|BG|CY|MT|EU)',
+        _cif_raw_early,
+    ))
+    _es_reverse_charge = bool(re.search(
+        r'(?i)inversi[oó]n\s+del?\s+sujeto\s+pasivo|reverse\s+charge',
+        bloque_texto,
+    ))
+    _es_factura_internacional = _es_eu_cif or _es_reverse_charge
+    if _es_factura_internacional and iva_importe_val > 0:
+        if _es_reverse_charge:
+            iva_importe_val = 0.0
+            log.info(
+                "[IVA INTL] reverse_charge explícito, CIF '%s' → iva=0, irpf=0, base=total=%.2f",
+                _cif_raw_early, total,
+            )
+            iva_importe_val = 0.0
+            irpf  = 0.0
+            base  = total
+            exento = total
+        else:
+            log.info(
+                "[IVA INTL] CIF EU '%s' sin reverse_charge explícito → IVA %.2f conservado",
+                _cif_raw_early, iva_importe_val,
+            )
+
+    if iva_importe_val > 0 and total > 0 and base > 0 and abs(iva_importe_val - total) <= 0.02:
+        iva_importe_val = 0.0
+        log.warning(
+            "[IVA_SANITY] iva=%.2f ≈ total=%.2f — probable confusión total/IVA → iva=0",
+            iva_importe_val, total,
+        )
+        iva_importe_val = 0.0
+
+    if (
+        iva_importe_val > 0 and base > 0 and total > 0
+        and abs(iva_importe_val - base) < 0.01
+        and abs(base + iva_importe_val - total) > 0.01
+    ):
+        _iva_candidato = round(total - base, 2)
+        _pct_candidato = (_iva_candidato / base) * 100 if base > 0 else 0
+        if 3.0 <= _pct_candidato <= 25.0:
+            log.warning(
+                "[IVA_SANITY] iva=%.2f == base=%.2f (duplicado), base+iva≠total → "
+                "recalculando iva=total-base=%.2f (%.1f%%)",
+                iva_importe_val, base, _iva_candidato, _pct_candidato,
+            )
+            iva_importe_val = _iva_candidato
+            _source["iva_importe"] = "recalculated_from_total_minus_base"
+
+    if irpf != 0.0 and base > 0 and abs(abs(float(irpf)) - float(base)) < 0.02:
+        log.warning(
+            "[IRPF_CRUCE_COLUMNA] |irpf|=%.2f ≈ base=%.2f — imposible. "
+            "Probable cruce de columna en tabla horizontal. Recuperando IRPF real...",
+            abs(float(irpf)), float(base),
+        )
+        _irpf_gap = round(float(base) + float(iva_importe_val) - float(total), 2)
+        _irpf_recuperado = None
+        if _irpf_gap > 0:
+            _pct_gap = (_irpf_gap / float(base) * 100) if float(base) > 0 else 0
+            if 3.0 <= _pct_gap <= 25.0:
+                _irpf_recuperado = -_irpf_gap
+                log.warning(
+                    "[IRPF_CRUCE_COLUMNA] Recuperado por diferencia: -%.2f€ (%.1f%%)",
+                    _irpf_gap, _pct_gap,
+                )
+        if _irpf_recuperado is None:
+            _irpf_dict_raw = data.get("importe_irpf")
+            if _irpf_dict_raw is not None:
+                _irpf_dict_val = float(limpiar_monto(str(_irpf_dict_raw)))
+                if (
+                    _irpf_dict_val != 0
+                    and abs(abs(_irpf_dict_val) - float(base)) > 0.02
+                    and abs(_irpf_dict_val) < float(base) * 0.30
+                ):
+                    _irpf_recuperado = _irpf_dict_val
+                    log.warning(
+                        "[IRPF_CRUCE_COLUMNA] Recuperado de importe_irpf: %.2f€",
+                        _irpf_dict_val,
+                    )
+        irpf = _irpf_recuperado if _irpf_recuperado is not None else 0.0
+        if _irpf_recuperado is None:
+            log.warning("[IRPF_CRUCE_COLUMNA] No se pudo recuperar → irpf=0")
+        _source["irpf"] = "recovered_cruce_columna"
+
+    if irpf != 0.0 and total > 0:
+        _irpf_abs = abs(irpf)
+        if base > 0 and _irpf_abs > base * 0.20:
+            log.warning("[IRPF_SANITY] %.2f > 20%% base %.2f → 0", _irpf_abs, base)
+            irpf = 0.0
+        elif abs(_irpf_abs - total) < 0.02:
+            log.warning("[IRPF_SANITY] %.2f ≈ total %.2f (confusión total/IRPF) → 0", _irpf_abs, total)
+            irpf = 0.0
+
+    if _es_factura_internacional and base > 0 and total > 0:
+        _desviacion_fiscal = abs((base + iva_importe_val - abs(irpf)) - total)
+        if _desviacion_fiscal > 0.50:
+            log.warning(
+                "[INTL CORRUPT] Desglose fiscal incongruente: "
+                "base=%.2f iva=%.2f irpf=%.2f ≠ total=%.2f (diff=%.2f) — "
+                "descartando desglose LLM, aplicando base=total",
+                base, iva_importe_val, irpf, total, _desviacion_fiscal,
+            )
+            base   = total
+            #iva_importe_val = 0.0
+            irpf   = 0.0
+            exento = total
+
+    # 4. Inferencia de base
+    _base_esta_bloqueada = False
+    if isinstance(data.get("_locked_fields"), dict):
+        _base_esta_bloqueada = data["_locked_fields"].get("base_imponible", {}).get("locked", False)
+
+    if total > 0 and base == 0 and not _es_factura_internacional and not _base_esta_bloqueada:
+        if iva_importe_val > 0 and total > iva_importe_val:
+            _base_desde_iva = round(total - iva_importe_val, 2)
+            _pct_desde_iva  = (iva_importe_val / _base_desde_iva * 100) if _base_desde_iva > 0 else 0
+            if _base_desde_iva > 0 and 1.0 <= _pct_desde_iva <= 35.0:
+                log.info(
+                    "[INFER BASE] base=0 con iva=%.2f ya capturado → "
+                    "base=total-iva=%.2f (%.1f%% IVA) — omitiendo inferencia de texto",
+                    iva_importe_val, _base_desde_iva, _pct_desde_iva,
+                )
+                base = _base_desde_iva
+                _source["base_imponible"] = "inferred_from_iva"
+        else:
+            _texto_up = bloque_texto.upper() if bloque_texto else ""
+            _iva_0_explicito = (
+                "IVA (0%)" in bloque_texto
+                or "IVA 0%" in _texto_up
+                or bool(re.search(r'\bIVA\b[^0-9\n]{0,20}\b0[\.,]00\b', bloque_texto))
+                or bool(re.search(r'\bTotal\s+IVA\b[^0-9]*0[,.]?0{0,2}\b', bloque_texto, re.I))
+                or bool(re.search(r'\bIVA\b\s*:?\s*0[,.]?0{0,2}\s*€?\b', bloque_texto))
+                or bool(re.search(r'\bIVA\b.{0,40}\bEXENTO\b|\bEXENTO\b.{0,40}\bIVA\b', _texto_up))
+                or bool(re.search(r'\bNO\s+SUJETO\b', _texto_up))
+                or bool(re.search(r'(?i)\biva\b[^\n]{0,30}\b0\s*%', bloque_texto))
+            )
+            if _iva_0_explicito:
+                log.warning(
+                    "[IVA_0_EXPLICITO] base=0 y texto indica IVA=0 → "
+                    "base=total=%.2f, iva=0 (iva previo=%.2f)",
+                    total, iva_importe_val,
+                )
+                base = total
+                iva_importe_val = 0.0
+                _source["base_imponible"] = "inferred_step4"
+                _source.pop("iva_importe", None)
+            else:
+                _hay_senal_iva = bool(re.search(r'\bIVA\b|\bVAT\b|\b\d{1,2}\s*%', bloque_texto))
+                if not _hay_senal_iva:
+                    log.warning(
+                        "[IVA_0_SEÑAL] base=0, sin señal IVA en texto → "
+                        "base=total=%.2f, iva=0 (iva previo=%.2f)",
+                        total, iva_importe_val,
+                    )
+                    base = total
+                    iva_importe_val = 0.0
+                    _source["base_imponible"] = "inferred_step4"
+                    _source.pop("iva_importe", None)
+                else:
+                    if re.search(r'\b4\s*%', bloque_texto):
+                        _pct = 4
+                    elif re.search(r'\b10\s*%', bloque_texto):
+                        _pct = 10
+                    else:
+                        _pct = 21
+                    base = round(total / (1 + _pct / 100), 2)
+                    iva_importe_val = round(total - base, 2)
+                    iva_pct_val = float(_pct) # Capturamos también la tasa deducida
+                    log.info(
+                        "[INFERENCIA] base=0 → base=%.2f€, iva=%.2f€ (%d%% inferido de texto)",
+                        base, iva_importe_val, _pct,
+                    )
+                    _source["base_imponible"] = "inferred_step4"
+                    _source["iva_importe"]    = "inferred_step4"
+                    _source["iva"]            = "inferred_step4"
+
+    # 4b. REGLA IVA 0%
+    if total > 0 and iva_importe_val == 0.0 and not _es_factura_internacional:
+        if exento != 0.0:
+            _cita_exento = bool(re.search(
+                r'\bexento[s]?\b|\bexenta[s]?\b|\bno\s+sujeto\b|\bexenci[oó]n\b',
+                bloque_texto, re.I
+            ))
+            if not _cita_exento:
+                log.debug("[IVA 0%%] Exento fantasma %s€ eliminado (no consta en texto).", exento)
+                exento = 0.0
+        if exento == 0.0 and abs(base - total) > 0.02:
+            if irpf != 0.0 and abs(base - (total + abs(irpf))) < 0.02:
+                pass
+            else:
+                _gap_4b  = round(float(total) - float(base), 2)
+                _pct_4b  = (_gap_4b / float(base) * 100) if float(base) > 0 else 0
+                _iva_txt = bool(re.search(r'\bIVA\b|\bVAT\b|\b\d{1,2}\s*%', bloque_texto))
+                _iva_fue_etiquetado = data.get("_src_iva") == "explicit_label"
+                if float(base) > 0 and _gap_4b > 0 and 1.0 <= _pct_4b <= 35.0 and _iva_txt and not _iva_fue_etiquetado:
+                    log.warning(
+                        "[IVA_INFERIDO_4B] iva=0, base=%.2f, total=%.2f → "
+                        "gap=%.2f (%.1f%%) con señal IVA en texto → infiriendo iva",
+                        float(base), float(total), _gap_4b, _pct_4b,
+                    )
+                    iva_importe_val = _gap_4b
+                    _source["iva_importe"] = "inferred_4b_gap"
+                else:
+                    log.warning(
+                        "[IVA_0_BASE] iva=0, base=%.2f≠total=%.2f → forzando base=total",
+                        float(base), float(total),
+                    )
+                    base = total
+
+    # =======================================================================
+    # 🧠 PASO 5: RESOLUCIÓN DE IDENTIDAD (NUEVO IDENTITY RESOLVER)
+    # =======================================================================
+    from .pipeline.identity_candidates import resolve_identity_from_legacy
+    
+    log.critical("=================== 🚨 OPERACIÓN CAZA-CIF 🚨 ===================")
+    log.critical("1. ANTES DEL RESOLVER 'data' contiene:")
+    log.critical("   - cif_vendedor: %r", data.get("cif_vendedor"))
+    log.critical("   - nif_emisor: %r", data.get("nif_emisor"))
+    
+    identidad = resolve_identity_from_legacy(data, bloque_texto)
+    data["_identity_diagnostics"] = identidad
+    
+    log.critical("2. RESULTADO DEL RESOLVER:")
+    log.critical("   - seller (vendedor): %s", identidad.get("seller"))
+    log.critical("   - customer (cliente): %s", identidad.get("customer"))
+    
+    _candidatos = identidad.get("candidates", [])
+    log.critical("   - candidates (CIFs detectados): %s", [c.get("value") for c in _candidatos])
+    log.critical("================================================================")
+    
+    # 1. Llamamos al nuevo orquestador (absorbe regex, OCR espacial y contexto)
+    identidad = resolve_identity_from_legacy(data, bloque_texto)
+    
+    # Guardamos los diagnósticos para auditoría/trazabilidad
+    data["_identity_diagnostics"] = identidad
+
+    # 2. Extraemos los ganadores indiscutibles
+    seller_data = identidad.get("seller")
+    customer_data = identidad.get("customer")
+
+    cif_vendedor = seller_data["id"] if seller_data else ""
+    cif_cliente = customer_data["id"] if customer_data else ""
+
+    # 3. Resolución de Nombres del Vendedor (Prioridad: Canónico > Rescatado > Extraído)
+    emisor_raw = str(data.get("nombre_vendedor") or data.get("emisor") or "").strip()
+    if seller_data and seller_data.get("name"):
+        emisor = seller_data["name"]  # Gana el nombre de la BD canónica
+    else:
+        emisor = emisor_raw
+        # Rescate radial: si tenemos CIF pero no nombre, buscamos alrededor
+        if (emisor in ["", "Proveedor Desconocido", None]) and cif_vendedor:
+            _nom_rescatado = buscar_nombre_cerca_cif(bloque_texto, cif_vendedor)
+            if _nom_rescatado:
+                emisor = _nom_rescatado
+                log.info("🎯 [RESCATE RADIAL] Encontrado emisor '%s' cerca de su CIF.", emisor)
+
+    if not emisor:
+        emisor = "Proveedor Desconocido"
+
+    # 4. Forzamos la sobreescritura del cliente si hay nombre canónico
+    if customer_data and customer_data.get("name"):
+        data["nombre_cliente"] = customer_data["name"]
+
+    log.info("🎯 [IDENTITY] Ganador Emisor: %s (%s)", emisor, cif_vendedor)
+    log.info("🎯 [IDENTITY] Ganador Cliente: %s", cif_cliente)
+
+    # =======================================================================
+    # PASO 6 & 7: EXTRACTOR NOMINAL Y PRE-CONSTRUCCIÓN DEL DICCIONARIO
+    # =======================================================================
+    fecha_raw = data.get("fecha") or data.get("fecha_factura") or ""
+    fecha = normalizar_fecha(fecha_raw)
+    if not fecha:
+        fecha = "01/01/2026"
+    
+    numero = limpiar_numero_factura(data.get("numero_factura") or data.get("numero"))
+    
+    _numero_bloqueado_ocr = None
+    if isinstance(data.get("_locked_fields"), dict):
+        _numero_bloqueado_ocr = data["_locked_fields"].get("numero_factura", {}).get("value")
+
+    if _numero_bloqueado_ocr:
+        numero = _numero_bloqueado_ocr
+    elif not numero or not numero_valido(str(numero)) or "GEN-" in str(numero):
+        centimos_id = int(round(total * 100))
+        fecha_id    = str(fecha).replace("/", "").replace("-", "")
+        prefijo     = "EMA" if emisor == "EMASESA" else "GEN"
+        numero      = f"{prefijo}-{fecha_id}-{centimos_id}"
+        
+    data["numero_factura"] = numero    
+
+    # Declaramos la variable del cliente en su sitio correcto de memoria
+    _cliente_bruto = str(data.get("cliente") or data.get("nombre_cliente") or "").strip()
+
+    # 🛑 PURGA Y RESCATE EXPRÉS (Atrapa a Isabel Mercado)
+    BASURA_NOMINAL = {"cliente", "del cliente", "nombre del cliente", "facturado a", "proveedor desconocido"}
+    if _cliente_bruto.lower() in BASURA_NOMINAL:
+        _cliente_bruto = ""
+
+    # 🧠 EXTRACCIÓN SEMÁNTICA PRO: ANCLAS DE PERSONA (CLIENTE)
+    if not _cliente_bruto:
+        # 1. Rescate Directo por Etiqueta
+        _m_etiqueta = re.search(r'(?i)(?:Nombre del cliente|Facturado a|Cliente)\s*:\s*([A-ZÁÉÍÓÚÑa-záéíóúñ\s]{5,50})', str(bloque_texto))
+        if _m_etiqueta:
+            _candidato = _m_etiqueta.group(1).split('\n')[0].strip()
+            if _candidato.lower() not in BASURA_NOMINAL:
+                log.info("🎯 [SEMÁNTICA PERSONA] Capturado cliente por etiqueta explícita: '%s'", _candidato)
+                _cliente_bruto = _candidato
+        
+        # 2. Rescate por Cortesía (Si lo anterior falla)
+        if not _cliente_bruto:
+            _m_persona = re.search(r'\b(SRA|SR|DON|DOÑA|TITULAR)[:\s\.]*([A-ZÁÉÍÓÚÑ\s]{5,50})', str(bloque_texto).upper())
+            if _m_persona:
+                _candidato_cliente = _m_persona.group(2).strip()
+                _candidato_cliente = re.sub(r'\s+', ' ', _candidato_cliente)
+                _candidato_cliente = re.split(r'\b(?:CALLE|C/|AVDA|URB|DNI|NIF|CIF|FACTURA|CONTRATO)\b', _candidato_cliente)[0].strip()
+                if len(_candidato_cliente) >= 5:
+                    log.info("🎯 [SEMÁNTICA PERSONA] Capturado cliente legítimo por fórmula de cortesía: '%s'", _candidato_cliente)
+                    _cliente_bruto = _candidato_cliente
+
+    # 📐 EXTRACCIÓN GEOMÉTRICA PRO: ENTORNO SUPERIOR IZQUIERDO (EMISOR)
+    #if emisor in ["", "Proveedor Desconocido", "Google Ireland Ltd"] or any(b in str(emisor).upper() for b in _EMISORES_BASURA):
+        #lineas_inicio = [linea.strip() for linea in str(bloque_texto).split('\n') if linea.strip()][:6]
+        #for linea in lineas_inicio:
+            #linea_up = linea.upper()
+            #if any(p in linea_up for p in ["FACTURA", "Nº", "PÁG", "FECHA", "CLIENTE", "SRA.", "SR.", "CONTRATO"]):
+                #continue
+            #if es_identificador_fiscal(linea) or len(linea) < 3:
+                #continue
+            #log.info("📐 [GEOMETRÍA CABECERA] Rescatado emisor legítimo de la cumbre izquierda del documento: '%s'", linea)
+            #emisor = linea
+            #break    
+
+    # Limpieza final de placeholders sobre la variable saneada
+    if _cliente_bruto and _RE_CODIGO_EN_CLIENTE.match(_cliente_bruto): _cliente_bruto = ""
+    if _cliente_bruto and _RE_METADATO_EN_CLIENTE.search(_cliente_bruto): _cliente_bruto = ""
+    if _cliente_bruto and _RE_BANCARIO_EN_CLIENTE.search(_cliente_bruto): _cliente_bruto = ""
+
+    log.info("DEBUG: Construyendo RES. Emisor: %s, CIF: %s, Total: %s", emisor, cif_vendedor, total)
+    log.critical(
+        "🚨 [IDENTITY PRE-RES] "
+        "cif_vendedor=%r | cif_cliente=%r | data.cif_vendedor=%r | "
+        "data.cif_cliente=%r | emisor_raw=%r",
+        cif_vendedor,
+        cif_cliente,
+        data.get("cif_vendedor"),
+        data.get("cif_cliente"),
+        emisor_raw,
+    )
+    
+    cif_vendedor = str(cif_vendedor or "").strip().upper()
+    cif_cliente = str(cif_cliente or "").strip().upper()
+    emisor = str(emisor or "").strip()
+    _cliente_bruto = str(_cliente_bruto or "").strip()
+
+    res = data.copy()
+
+    # ================================================================
+    # 🔒 IDENTITY SNAPSHOT
+    # ================================================================
+
+    cif_vendedor = str(cif_vendedor or "").strip().upper()
+    cif_cliente = str(cif_cliente or "").strip().upper()
+    emisor = str(emisor or "").strip()
+    _cliente_bruto = str(_cliente_bruto or "").strip()
+
+    # ================================================================
+    # IDENTIDAD FINAL
+    # ================================================================
+
+    # 1. VENDEDOR: Solo actualizamos si hay dato nuevo, si no, conservamos el legacy
+    if cif_vendedor:
+        res["cif_vendedor"] = cif_vendedor[:20]
+    elif not res.get("cif_vendedor") and res.get("nif_emisor"):
+        res["cif_vendedor"] = res.get("nif_emisor")
+
+    # 2. CLIENTE: Misma protección
+    if cif_cliente:
+        res["cif_cliente"] = cif_cliente[:20]
+    elif not res.get("cif_cliente") and res.get("nif_cliente"):
+        res["cif_cliente"] = res.get("nif_cliente")
+    
+    # 💥 FIX: priorizar el nombre ya limpiado por el normalizador
+    nombre_limpio = (
+        str(data.get("nombre_vendedor") or "").strip()
+        or str(emisor or "").strip()
+        or "Proveedor Desconocido"
+    )
+    res["emisor"] = nombre_limpio[:250]
+    res["nombre_vendedor"] = nombre_limpio[:250]
+    res["cliente"] = _cliente_bruto[:250]
+    
+    # ============================================================
+    # 🛡️ LEY MARCIAL DE IDENTIDAD (El último filtro)
+    # ============================================================
+    # 1. LOCK ABSOLUTO
+    _locked_cif = res.get("_locked_fields", {}).get("cif_vendedor")
+    if (
+        _locked_cif
+        and _locked_cif.get("locked")
+        and _locked_cif.get("value")
+    ):
+        valor_blindado = str(_locked_cif["value"]).strip().upper()
+        if res.get("cif_vendedor") != valor_blindado:
+            res["cif_vendedor"] = valor_blindado
+            res["nif_emisor"] = valor_blindado
+            _ftrace(res, "identity_lock_restore", "cif_vendedor", valor_blindado)
+
+    # 2. CATÁLOGO CANÓNICO
+    cif_final = (
+        res.get("cif_vendedor")
+        or res.get("nif_emisor")
+        or ""
+    ).strip().upper()
+    
+    # 👇 Definimos el catálogo aquí para que Python lo encuentre siempre
+    _NOMBRES_CANONICOS_NORM = {
+        "28829809E": "EMASESA",
+        # Podrás añadir más grandes empresas aquí en el futuro (Iberdrola, Endesa...)
+    }
+    
+    if cif_final in _NOMBRES_CANONICOS_NORM:
+        nombre_oficial = _NOMBRES_CANONICOS_NORM[cif_final]
+        if (
+            res.get("nombre_vendedor") != nombre_oficial
+            or res.get("emisor") != nombre_oficial
+        ):
+            res["nombre_vendedor"] = nombre_oficial
+            res["emisor"] = nombre_oficial
+            _ftrace(res, "canonical_identity_enforced", "nombre_vendedor", nombre_oficial)
+    
+    res["base"] = res["base_imponible"] = float(base)
+    res["iva_importe"] = res["iva"] = float(iva_importe_val)
+    res["importe_irpf"] = res["irpf"] = float(irpf)
+    res["exento"] = float(exento)
+    res["total"] = float(total)
+
+    try:
+        from learning.math_validator import validate_amounts as _va
+
+        _b = _num_or_zero(
+            res.get("base") or res.get("base_imponible")
+        )
+
+        _v = _num_or_zero(
+            res.get("iva_importe") or res.get("iva")
+        )
+
+        _i = _num_or_zero(
+            res.get("importe_irpf") or res.get("irpf")
+        )
+
+        _t = _num_or_zero(
+            res.get("total") or res.get("total_factura")
+        )
+
+        _e = _num_or_zero(
+            res.get("exento")
+        )
+
+        _hay_irpf_kw = bool(
+            re.search(
+                r"(?i)retenci[oó]n|irpf|a\s+cuenta",
+                bloque_texto or "",
+            )
+        )
+
+        log.info(
+            "[MATH_FINAL_INPUT] base=%.2f iva=%.2f irpf=%.2f "
+            "total=%.2f exento=%.2f",
+            _b,
+            _v,
+            _i,
+            _t,
+            _e,
+        )
+
+        # ---------------------------------------------------------------
+        # CASO 1: No tenemos base suficiente para validar el cuadre
+        # ---------------------------------------------------------------
+        #
+        # Ejemplo Octopus:
+        # base = 0
+        # iva  = 104.56
+        # total = 120.58
+        #
+        # Como falta la base, el validador no debe "arreglarla"
+        # automáticamente ni considerar que todo está correcto.
+        #
+        if _t > 0 and _b <= 0 and _v > 0:
+
+            res["math_inconsistencia"] = True
+            res["financial_structure_valid"] = False
+
+            log.critical(
+                "🚨 [ÁRBITRO MATEMÁTICO] Total e IVA presentes "
+                "pero falta la base imponible. "
+                "No se puede considerar la factura matemáticamente válida."
+            )
+
+        # ---------------------------------------------------------------
+        # CASO 2: Tenemos base + IVA + total
+        # ---------------------------------------------------------------
+        else:
+
+            _vr = _va(
+                _b,
+                _v,
+                _i,
+                _t,
+                _e,
+                has_irpf_signal=_hay_irpf_kw,
+            )
+
+            log.info(
+                "[MATH_FINAL_OUTPUT] ok=%s corrected=%s note=%s",
+                _vr.get("ok"),
+                _vr.get("corrected"),
+                _vr.get("note"),
+            )
+
+            if not _vr.get("ok") and not _vr.get("corrected"):
+
+                res["math_inconsistencia"] = True
+                res["financial_structure_valid"] = False
+
+                log.critical(
+                    "🚨 [ÁRBITRO MATEMÁTICO] "
+                    "Contradicción matemática irresoluble."
+                )
+
+            elif _vr.get("ok"):
+
+                # La factura cuadra.
+                res["math_inconsistencia"] = False
+                res["financial_structure_valid"] = True
+
+                log.info(
+                    "✅ [ÁRBITRO MATEMÁTICO] "
+                    "Importes matemáticamente consistentes."
+                )
+
+    except Exception as e:
+
+        log.exception(
+            "🚨 [MATH] Error durante validación matemática: %s. "
+            "La factura NO puede considerarse matemáticamente válida.",
+            e,
+        )
+
+        res["math_inconsistencia"] = True
+        res["financial_structure_valid"] = False
+        res["math_validation_error"] = True
+        
+    # ================================================================
+    # 🛡️ RESTAURACIÓN FINAL DE LOCKS
+    # Protege identificadores y cabeceras (NIF, nº factura, fecha).
+    # NUNCA restaurar campos financieros/monetarios: su autoridad
+    # reside en el cálculo contable derivado y saneado.
+    # ================================================================
+    _locked_fields = res.get("_locked_fields") or {}
+    _campos_financieros = {
+        "base", "base_imponible", "iva", "iva_importe", 
+        "irpf", "importe_irpf", "total", "total_factura", "exento"
+    }
+
+    for _field, _meta in _locked_fields.items():
+        if not isinstance(_meta, dict) or not _meta.get("locked"):
+            continue
+
+        # 🚨 NO RESTAURAR CAMPOS FINANCIEROS
+        if _field in _campos_financieros:
+            continue
+
+        _locked_value = _meta.get("value")
+
+        if _locked_value in (None, ""):
+            continue
+
+        _current_value = res.get(_field)
+
+        if _current_value != _locked_value:
+            log.critical(
+                "🛡️ [FINAL LOCK RESTORE] %s: %r -> %r",
+                _field,
+                _current_value,
+                _locked_value,
+            )
+            res[_field] = _locked_value
+            
+    # -------------------------------------------------------------------
+    # 🚦 7. ÁRBITRO ÚNICO DE ESTADO
+    # -------------------------------------------------------------------
+    from .pipeline.state_arbiter import resolver_estado
+    
+    _resultado_final = res  # 👈 ESTA ES LA LÍNEA MÁGICA QUE FALTABA
+    
+    if "confianza" not in _resultado_final:
+        _resultado_final["confianza"] = calcular_confianza(_resultado_final)
+        
+    _resultado_final["estado"] = resolver_estado(_resultado_final)
+
+
+    # =======================================================================
+    # 🔬 AUTOPSIA FINAL
+    # =======================================================================
+
+    log.critical("--- AUTOPSIA FINAL ---")
+
+    log.critical(
+        "NOMBRE_EMISOR: %s",
+        _resultado_final.get("emisor"),
+    )
+
+    log.critical(
+        "CIF_EMISOR: %s",
+        _resultado_final.get("cif_vendedor"),
+    )
+
+    log.critical(
+        "NOMBRE_CLIENTE: %s",
+        _resultado_final.get("cliente"),
+    )
+
+    log.critical(
+        "VALORES_LOCK: %s",
+        _resultado_final.get("_locked_fields"),
+    )
+
+    log.critical(
+        "DEBUG_PROCESO: El sistema va a devolver este diccionario: %s",
+        _resultado_final,
+    )
+
+    if "confianza" not in _resultado_final:
+        _resultado_final["confianza"] = calcular_confianza(_resultado_final)
+        
+    # 🛡️ SEGURO DE VIDA PARA KEYERROR
+    _resultado_final.setdefault("cif_vendedor", "")
+
+    return _resultado_final
+
+def detectar_tipo_factura(texto):
+    t = texto.lower()
+    suministros = ["repsol", "energia", "iberdrola", "endesa", "octopus",
+                "naturgy", "emasesa", "aguas", "canal"]
+    if any(k in t for k in suministros):
+        return "Suministros"
+    return "Estándar"
+
+# ---------------------------------------------------------------------------
+# EXTRACCIÓN POR REGEX
+# ---------------------------------------------------------------------------
+
+def _por_regex(texto, pool=None):
+    data = {}
+
+    def _set_extracted(field, value, tag="UNKNOWN"):
+        if not value:
+            return
+
+        import logging
+        log = logging.getLogger("iatlas.extractor")
+
+        # ================================================================
+        # 🛡️ LOCK GUARD
+        # Regex nunca puede pisar una evidencia fuerte ya bloqueada.
+        # ================================================================
+        locked_fields = data.get("_locked_fields") or {}
+        locked = locked_fields.get(field)
+
+        if isinstance(locked, dict) and locked.get("locked"):
+            locked_value = locked.get("value")
+
+            log.warning(
+                "🛡️ [REGEX BLOCKED] field=%r candidato=%r "
+                "rechazado; valor bloqueado=%r source=%r",
+                field,
+                value,
+                locked_value,
+                locked.get("source"),
+            )
+
+            if locked_value not in (None, ""):
+                data[field] = locked_value
+
+            return
+
+        log.critical(
+            "🚨 [REGEX WRITE] field=%r value=%r TAG=%r | ANTES=%r",
+            field,
+            value,
+            tag,
+            data.get(field),
+        )
+
+        if pool is not None:
+            log.info(
+                "🚨 [REGEX CHIVATO] Proponiendo %s = %s "
+                "(Origen: %s)",
+                field,
+                value,
+                tag,
+            )
+            pool.propose(
+                field=field,
+                value=value,
+                source="regex",
+                confidence=0.6,
+                kind="extracted",
+            )
+
+        data[field] = value
+    texto = texto.replace('\x00', '-')
+    
+    texto = re.sub(r'(?i)(ID\s+fiscal|CIF|NIF)[:\s]+([A-Z0-9]{4})\s+([A-Z0-9]{4})\s+([A-Z0-9]{4})', r'\1: \2\3\4', texto)
+    
+    # Dentro de def _por_regex(texto):
+    texto_limpio_importes = re.sub(r'\b[A-Z]{2}\d{7,10}[A-Z]?\b', ' [CIF_FILTERED] ', texto)
+    texto_limpio = limpiar_ibanes(texto_limpio_importes)
+
+    _dos_col = re.search(r'(?i)datos\s+del\s+emisor[^\n]*\n([A-ZÁÉÍÓÚÑ][A-Za-záéíóúñ\s]{3,35?})\s{2,}([A-ZÁÉÍÓÚÑ][^\n]{3,40})', texto)
+    if _dos_col:
+        _nombre_emisor_col = _dos_col.group(1).strip()
+        _nombre_cliente_col = _dos_col.group(2).strip()
+        if not re.search(r'(?i)^(:?urb|calle|c/|avda|plaza|num|\d)', _nombre_emisor_col):
+            if not data.get("nombre_vendedor"):
+                data["nombre_vendedor"] = _nombre_emisor_col
+                log.debug("[2COL] Emisor: '%s'", _nombre_emisor_col)
+        if not re.search(r'(?i)^(:?urb|calle|c/|avda|plaza|num|\d)', _nombre_cliente_col):
+            if not data.get("nombre_cliente"):
+                data["nombre_cliente"] = _nombre_cliente_col
+                log.debug("[2COL] Cliente: '%s'", _nombre_cliente_col)
+
+    vat_emisor = re.search(r'(?i)(?:IE\s+VAT|VAT\s+Reg(?:\.\s*No)?\.?|N[úu]mero\s+de\s+IVA)[:\s]+([A-Z]{2}[A-Z0-9]{5,12})', texto)
+    if vat_emisor:
+        _set_extracted("cif_vendedor", vat_emisor.group(1).upper())
+
+    if not data.get("cif_vendedor"):
+        cif = RE_NIF_ES.search(texto_limpio)
+        if cif:
+            nif_detectado = cif.group().upper()
+            _set_extracted(
+                "nif_emisor",
+                nif_detectado,
+                tag="REGEX_NIF_FALLBACK",
+            )
+            log.info(
+                "[REGEX NIF] NIF candidato a emisor: %s",
+                nif_detectado,
+            )
+
+    if not data.get("cif_vendedor"):
+        vat = re.search(
+            r'(?:N[úu]mero\s+de\s+IVA|VAT)[:\s#.]*([A-Z]{2}[A-Z0-9]{5,10})',
+            texto, re.I
+        )
+        if vat:
+            _set_extracted("cif_vendedor", vat.group(1).upper())
+
+    fechas = re.findall(r'\b(\d{1,2}[/\-]\d{1,2}[/\-]\d{4})\b', texto)
+    if fechas:
+        def a_tuple(f):
+            m = re.match(r'(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})', f)
+            if m:
+                return (int(m.group(3)), int(m.group(2)), int(m.group(1)))
+            return (0, 0, 0)
+        fechas_ok = [f for f in fechas if a_tuple(f)[0] >= 2000]
+        if fechas_ok:
+            _set_extracted("fecha", max(fechas_ok, key=a_tuple))
+
+    if not data.get("fecha"):
+        _fechas_yy = re.findall(r'\b(\d{1,2}/\d{1,2}/\d{2})\b', texto)
+        for _fyy in _fechas_yy:
+            _norm = normalizar_fecha(_fyy)
+            if _norm:
+                _set_extracted("fecha", _norm)
+                break
+
+    if not data.get("fecha"):
+        _fecha_texto = re.search(
+            r'\b(\d{1,2})\s+(?:de\s+)?([a-záéíóúñA-Za-z]+)\s+(?:de\s+)?(\d{4})\b',
+            texto, re.I
+        )
+        if _fecha_texto:
+            _candidato = f"{_fecha_texto.group(1)} {_fecha_texto.group(2)} {_fecha_texto.group(3)}"
+            _norm = normalizar_fecha(_candidato)
+            if _norm:
+                _set_extracted("fecha", _norm)
+                log.debug("[FECHA TEXTO] '%s' → %s", _candidato, _norm)
+
+    if not data.get("fecha"):
+        _fecha_en = re.search(
+            r'\b(January|February|March|April|May|June|July|August|September|October|November|December)'
+            r'\s+(\d{1,2}),?\s+(\d{4})\b',
+            texto, re.I
+        )
+        if _fecha_en:
+            _norm = normalizar_fecha(f"{_fecha_en.group(1)} {_fecha_en.group(2)} {_fecha_en.group(3)}")
+            if _norm:
+                _set_extracted("fecha", _norm)
+                log.debug("[FECHA EN] '%s %s %s' → %s", _fecha_en.group(1), _fecha_en.group(2), _fecha_en.group(3), _norm)
+
+    _tiene_terminal_financiado = bool(re.search(
+        r'(?i)otros\s+pagos|pago\s+aplazado|cuota\s+(?:de\s+)?(?:terminal|financiaci[oó]n)|'
+        r'terminal\s+financiad[oa]|dispositivo\s+financiad[oa]',
+        texto
+    ))
+
+    total_match = re.search(
+        r'(?i)(?:'
+        r'total\s+factura|'
+        r'factura\s+final\b[^\n]{0,60}\n?[^\d]{0,10}|'
+        r'importe\s+total[^\d]{0,20}|'
+        r'total\s+(?:en\s+eur|a\s+pagar|importe\s+(?:de\s+la\s+)?factura|iva\s+incl\.?)'
+        r')[^\d]{0,15}([\d]{1,9}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)(?!\d)',
+        texto
+    )
+    # 🛑 NUEVA EXTRACCIÓN ROBUSTA DE TOTAL
+    total_robusto = extraer_total_robusto(texto) # ¡Usamos "texto"!
+    
+    if total_robusto is not None:
+        _set_extracted("total_factura", str(total_robusto))
+        data["_src_total"] = "regex_robusto"
+    elif total_match:
+        _set_extracted("total_factura", total_match.group(1))
+        data["_src_total"] = "explicit_label"
+    else:
+        _m_total_multi = re.search(
+            r'(?i)\btotal\b[^\d\n]{0,15}[\d.,]+\s+([\d]{1,9}(?:[.,]\d{3})*(?:[.,]\d{2})?)(?!\d)\s*(?:EUR|€)',
+            texto
+        )
+        if _m_total_multi:
+            _v_multi = limpiar_monto(_m_total_multi.group(1))
+            if _v_multi > 0:
+                _set_extracted("total_factura", _m_total_multi.group(1))
+                log.debug("[TOTAL MULTI] Capturado segundo importe: %s€", _v_multi)
+
+        if not data.get("total_factura"):
+            _totales_iter = list(re.finditer(
+                r'(?i)\btotal\b[^\d]{0,20}([\d]{1,9}(?:[.,]\d{3})*(?:[.,]\d{2})?)(?!\d)',
+                texto
+            ))
+            for _m_tot in reversed(_totales_iter):
+                _v = limpiar_monto(_m_tot.group(1))
+                if _v > 0:
+                    _set_extracted("total_factura", _m_tot.group(1))
+                    break
+
+    if _tiene_terminal_financiado:
+        _m_tap = re.search(
+            r'(?i)total\s+a\s+pagar[:\s€]{0,10}'
+            r'([\d]{1,3}(?:[.,]\d{3})*(?:[.,]\d{2}))',
+            texto
+        )
+        if _m_tap:
+            _val_tap    = limpiar_monto(_m_tap.group(1))
+            _val_actual = limpiar_monto(data.get("total_factura", 0))
+            if _val_tap > _val_actual:
+                _set_extracted("total_factura", _m_tap.group(1))
+                log.debug(
+                    "[TERMINAL FINANCIADO] Total a Pagar (%s€) sustituye a Total Factura (%s€)",
+                    _val_tap, _val_actual,
+                )
+
+    _IRPF_PATRONES = [
+        r'(?i)i\.r\.p\.f\.?\s+[\d.,]+\s*%\s+([\d.,]+)',
+        r'(?i)(?:importe\s+irpf|irpf\s+\d+\s*%)[^\d\-]{0,10}(-?[\d.,]+)',
+        r'(?i)retenci[oó]n\s+profesional[^\d\-]{0,10}(-?[\d.,]+)',
+        r'(?i)retenci[oó]n\s+\d+\s*%\s+(-?[\d.,]+[.,]\d{2})',
+        r'(?i)(?:retenci[oó]n|ret\.?)[^\d]{0,30}\d+[.,]\d+\s+\d+%?\s+(-?[\d.,]+)',
+        r'(?i)\bretenci[oó]n\b[^\n]*?(-[\d.,]+)\s*€',
+        r'(?i)(?:retenci[oó]n\s+a\s+cuenta|a\s+cuenta\s+(?:de\s+)?(?:irpf|renta))[^\d\-\(]{0,15}(-?[\d.,]+|\([\d.,]+\))',
+        r'(?i)(?:irpf|retenci[oó]n|ret\.?)[^\n]*\(([\d.,]+)\)',
+        r'(?i)retenci[oó]n[^\n]*\n[^\d\-]{0,5}(-[\d.,]+[.,]\d{2})',
+        r'(?i)\birpf\b[^\d\-\(]{0,15}(-?[\d.,]+)',
+        r'(?i)(?:renta|retenci[oó]n)[^\d\-\(]{0,30}-(\d{1,3}[.,]\d{2})',
+    ]
+    irpf_encontrado = None
+    for _ip, patron in enumerate(_IRPF_PATRONES):
+        m = re.search(patron, texto)
+        if m:
+            val = m.group(1).replace('€', '').strip()
+            if val.startswith('(') and val.endswith(')'):
+                val = val[1:-1]
+            monto = limpiar_monto(val)
+            if monto != 0:
+                irpf_encontrado = -abs(monto)
+                log.debug("[IRPF] Encontrado con patrón %d: %s€", _ip + 1, irpf_encontrado)
+                break
+
+    if irpf_encontrado is not None:
+        _set_extracted("importe_irpf", irpf_encontrado)
+        data["_src_irpf"] = "explicit_label"
+        
+    #res_base  = extraer_campo_por_linea(texto, ["base imponible", "base"])
+    #res_total = extraer_campo_por_linea(texto, ["total a pagar", "importe total", "total factura", "total"], es_total=True)
+    
+    #if res_base:
+            #_set_extracted("base_imponible", res_base["valor"])
+            #data["_src_base"] = res_base["source"]
+            
+            # --- ESPÍA AÑADIDO AQUÍ ---
+            #import traceback
+            #log.critical("🚨 [TRAZA_BASE] Asignación desde MOTOR en línea: %s", "EXTRACTOR_LINEA")
+            #log.critical("Valor asignado: %s", data.get("base_imponible"))
+            #log.critical("Stack trace: %s", "".join(traceback.format_stack()[-5:]))
+            # --------------------------
+            
+            #log.info("✅ [MOTOR] Base extraída: %s (Línea: %s)", res_base["valor"], res_base["linea"])
+    
+    # 🛡️ ESCUDO STRICTO PARA EL IVA (Sustituye a extraer_campo_por_linea)
+    #match_iva = re.search(
+    #    r'(?i)\b(?:IVA\s*(?:al\s*)?\d{1,2}\s*%?|Impuesto\s+sobre\s+el\s+Valor\s+Añadido|Cuota\s+IVA|IVA\s+repercutido)\b[^\d]{0,15}(\d{1,6}[,\.]\d{2})', 
+    #    texto
+    #)
+    #if match_iva:
+    #    _set_extracted("iva_importe", match_iva.group(1), tag="MOTOR_ESTRICTO")
+    #    data["_src_iva"] = "explicit_label"
+    #    log.info("✅ [MOTOR ESTRICTO] IVA extraído: %s", data["iva_importe"])
+        
+    #if res_total and not data.get("total_factura"):
+        #_set_extracted("total_factura", res_total["valor"])
+        #data["_src_total"] = res_total["source"]
+        #log.info("✅ [MOTOR] Total extraído: %s (Línea: %s)", res_total["valor"], res_total["linea"])    
+
+    linea_fiscal = re.search(
+        r'BASE\s+IMPONIBLE[^\n]*TOTAL\s+FACTURA\s*\n'
+        r'([\d.,]+)\s*€?\s+([\d.,]+)\s+([\d.,]+)\s*€?\s+'
+        r'[\d.,]+\s+(-?[\d.,]+)\s*€?\s+([\d.,]+)\s*€',
+        texto, re.I
+    )
+    if linea_fiscal:
+        _set_extracted("base_imponible", linea_fiscal.group(1))
+        data["_src_base"]      = "explicit_label"
+        _set_extracted("iva_importe", linea_fiscal.group(3), tag="LINEA_FISCAL")
+        data["_src_iva"]       = "explicit_label"
+
+        _irpf_linea = abs(limpiar_monto(linea_fiscal.group(4)))
+        if _irpf_linea > 0:
+            _irpf_existente = data.get("importe_irpf")
+            _irpf_existente_val = float(limpiar_monto(str(_irpf_existente))) if _irpf_existente is not None else 0.0
+            _base_existente_val = float(limpiar_monto(str(data.get("base_imponible") or 0)))
+            _irpf_es_cruce = (
+                _base_existente_val > 0
+                and abs(abs(_irpf_existente_val) - _base_existente_val) < 0.02
+            )
+            if not _irpf_existente or _irpf_es_cruce:
+                _set_extracted("importe_irpf", -_irpf_linea)
+                log.debug("[linea_fiscal] IRPF capturado: -%.2f€", _irpf_linea)
+
+        total_fiscal = linea_fiscal.group(5)
+        if not data.get("total_factura"):
+            _set_extracted("total_factura", total_fiscal)
+
+        t_actual = limpiar_monto(data.get("total_factura", 0))
+        b_actual = limpiar_monto(data.get("base_imponible", 0))
+        if abs(t_actual - b_actual) < 0.02 and t_actual > 0:
+            _set_extracted("total_factura", total_fiscal)
+            log.debug("[FIX TOTAL] Total corregido: %s → %s (era igual a la base)", t_actual, total_fiscal)
+    else:
+        # 1. MOTOR NUEVO: Extracción por líneas (Prioridad alta)
+        res_base  = extraer_campo_por_linea(texto, ["base imponible", "base"])
+        
+        if res_base:
+            _set_extracted("base_imponible", res_base["valor"])
+            data["_src_base"]      = res_base["source"]
+            log.info("✅ [MOTOR] Base extraída: %s (Línea: %s)", res_base["valor"], res_base["linea"])
+
+        # 2. FALLBACK: Si el motor nuevo NO encontró nada, usamos las regex antiguas
+       
+        _RE_LINEA_LEGAL = re.compile(
+            r'^[^\n]*(?:art[ií]culo\s+\d|directiva\s+\d|ley\s+\d|decreto\s+\d|reglamento\s+\d)[^\n]*$',
+            re.I | re.M,
+        )
+        _texto_sin_legales = _RE_LINEA_LEGAL.sub('', texto)
+
+
+        if data.get("iva_importe") is None:
+            if re.search(r'(?i)\biva\b[^\n]{0,30}\b0\s*%', _texto_sin_legales):
+                _set_extracted("iva_importe", "0")
+                data["_src_iva"]    = "explicit_label"
+                log.debug("[IVA_CERO] Detectado IVA 0%% explícito en formato no estándar")
+
+    if not data.get("cif_vendedor"):
+        vat_eu = re.search(
+            r'(?i)(?:IE\s+VAT|VAT\s+Reg(?:\.\s*No)?\.?)[:\s]+([A-Z]{2}[A-Z0-9]{5,12})',
+            texto
+        )
+        if vat_eu:
+            _set_extracted("cif_vendedor", vat_eu.group(1).upper())
+
+    if data.get("numero_factura"):
+        _set_extracted("numero_factura", data["numero_factura"].replace('\x00', '-').strip('-'))
+
+    num_match_repsol = re.search(
+        r'(?i)fecha\s+y\s+n[ºo°]?\s*factura[:\s.]+[\d./]+\s*/\s*(\d{6,})',
+        texto
+    )
+    if num_match_repsol:
+        _set_extracted("numero_factura", num_match_repsol.group(1).strip())
+    else:
+        num_match = re.search(
+            r'(?i)(?:n[uú]mero\s+de\s+factura|factura\s*n[oº°]?|n[oº°]\s*factura|'
+            r'invoice\s+number|invoice\s+n[oº°]?)[:\s#.]{0,5}'
+            r'(?:#\s*)?([A-Z0-9][A-Z0-9./\-]{2,20})',
+            texto
+        )
+        if num_match:
+            candidato = limpiar_numero_factura(num_match.group(1))
+            if numero_valido(candidato) and not parece_fecha(candidato):
+                _set_extracted("numero_factura", candidato)
+
+    if not data.get("numero_factura"):
+        num_hash = re.search(r'(?m)^\s*#\s*([A-Z]{1,6}\d{2,6}[-/][A-Z0-9][A-Z0-9./\-]{1,20})\b', texto, re.I)
+        if num_hash:
+            candidato = limpiar_numero_factura(num_hash.group(1))
+            if numero_valido(candidato) and not parece_fecha(candidato):
+                _set_extracted("numero_factura", candidato)
+
+    nombre_emisor = extraer_nombre_emisor_por_etiqueta(texto)
+    if nombre_emisor:
+        data["nombre_vendedor"] = nombre_emisor
+
+    if not data.get("nombre_vendedor") and data.get("cif_vendedor"):
+        _nombre_ancla = buscar_nombre_cerca_cif(texto, data["cif_vendedor"])
+        if _nombre_ancla:
+            data["nombre_vendedor"] = _nombre_ancla
+            log.debug("[CIF ANCLA] Nombre detectado cerca del CIF '%s': '%s'", data["cif_vendedor"], _nombre_ancla)
+    data = extraer_nombre_cabecera(texto, texto, data)        
+
+    nombre_cliente = extraer_nombre_cliente_por_etiqueta(texto)
+    if nombre_cliente:
+        data["nombre_cliente"] = nombre_cliente
+
+    cif_cliente = extraer_cif_cliente_por_etiqueta(texto)
+    if cif_cliente:
+        _set_extracted("cif_cliente", cif_cliente)
+
+    #_patrones_total = [
+    #    (r'(?i)total\s+a\s+pagar[:\s€]{0,5}([\d.,]+)',          60),
+    #    (r'(?i)total\s+factura[:\s€]{0,5}([\d.,]+)',             55),
+    #    (r'(?i)importe\s+total[:\s€]{0,5}([\d.,]+)',             50),
+    #    (r'(?i)total\s+invoice[:\s€]{0,5}([\d.,]+)',             50),
+    #    (r'(?i)\\btotal\\b[:\\s€]{1,5}([\\d.,]+)',                    35),
+    #    (r'(?i)amount\\s+due[:\\s€]{0,5}([\\d.,]+)',                40),
+    #]
+    #_mejor_total = None
+    #_mejor_score = -1
+    #for _patron, _score in _patrones_total:
+    #    _m = re.search(_patron, texto)
+    #    if _m and _score > _mejor_score:
+    #        _val = money(_m.group(1))
+    #        if _val > 0:
+    #            _mejor_total  = _m.group(1)
+    #            _mejor_score  = _score
+
+    #if _mejor_total and not data.get("total_factura"):
+    #   _set_extracted("total_factura", _mejor_total)
+
+    return data
+
+
+def limpiar_extracciones_erroneas(data, bloque_texto):
+    """
+    Filtro de seguridad avanzada.
+    VERSIÓN SANEADA: Ya no destruye datos poniendo ceros a la fuerza.
+    """
+    TABLA_KW = {
+        "descripción", "descripcion", "concepto", "cantidad", "cant.", 
+        "uds", "unidad", "precio", "importe", "tarifa", "horas", 
+        "hora", "subtotal", "análisis"
+    }
+    RESUMEN_KW = {"base imponible", "iva", "irpf", "total", "cuota"}
+
+    for linea in bloque_texto.splitlines():
+        l_low = linea.lower()
+        if any(k in l_low for k in RESUMEN_KW):
+            continue
+        if not any(k in l_low for k in TABLA_KW):
+            continue
+        if len(re.findall(r"\d+[.,]?\d*", linea)) < 2:
+            continue
+
+        for campo, src in (("base", data.get("_src_base")), ("iva", data.get("_src_iva")), ("total", data.get("_src_total"))):
+            if src == "explicit_label":
+                continue
+            val = str(data.get(campo, "")).strip()
+            if val and re.search(rf"\b{re.escape(val)}\b", linea):
+                log.warning("🚫 [EXTRACTOR] %s=%s detectado en línea de tabla. Delegando al Resolver.", campo, val)
+                # data[campo] = 0  <-- Eliminado: dejamos que el CandidatePool decida
+
+    try:
+        str_total = str(data.get("total") or "0").replace(",", ".")
+        str_iva = str(data.get("iva") or data.get("iva_importe") or "0").replace(",", ".")
+        total_val = float(re.sub(r"[^\d.]", "", str_total) or 0)
+        iva_val = float(re.sub(r"[^\d.]", "", str_iva) or 0)
+        
+        if iva_val > 0 and total_val > 0:
+            if iva_val > (total_val * 0.5):
+                log.warning("☢️ [FILTRO NUCLEAR] IVA absurdo (%s) vs total (%s). Delegando al Resolver.", iva_val, total_val)
+                # if "iva" in data: data["iva"] = 0.0                  <-- Eliminado
+                # if "iva_importe" in data: data["iva_importe"] = 0.0  <-- Eliminado
+    except Exception as e:
+        log.debug("⚠️ [FILTRO NUCLEAR] Ignorado por formato no procesable: %s", e)
+
+
+def ejecutar_validaciones(data):
+    """Genera flags de estado sin modificar datos."""
+    _base = money(data.get("base_imponible") or data.get("base") or 0)
+    _iva = money(data.get("iva_importe") or data.get("iva") or 0)
+    _total = money(data.get("total_factura") or data.get("total") or 0)
+    
+    if _iva >= _total and _total > 0:
+        data["financial_structure_valid"] = False
+    else:
+        data["financial_structure_valid"] = True
+        
+    if _base > 0 and _total > 0 and abs((_base + _iva) - _total) > 0.05:
+        data["math_inconsistencia"] = True
+    else:
+        data["math_inconsistencia"] = False
+
+
+def validar_campos_con_ocr(data, texto_ocr):
+    """
+    Verifica que los identificadores literales existan realmente en el OCR.
+    """
+    if not texto_ocr or not isinstance(data, dict):
+        return
+
+    limpio = re.sub(r'[^A-Z0-9]', '', texto_ocr.upper())
+
+    for campo in ("cif_vendedor", "cif_cliente", "numero_factura", "iban"):
+        valor = data.get(campo)
+        if not valor:
+            continue
+
+        normalizado = re.sub(r'[^A-Z0-9]', '', str(valor).upper())
+
+        if normalizado and normalizado not in limpio:
+            log.warning("[OCR VERIFY] %s=%s no aparece en OCR literal. Eliminado.", campo, valor)
+            data[campo] = ""
+            
+            if "_locked_fields" in data and campo in data["_locked_fields"]:
+                del data["_locked_fields"][campo]
+    
+    
