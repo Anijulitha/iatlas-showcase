@@ -6,7 +6,7 @@ I.Atlas is a comprehensive B2B SaaS platform designed to automate accounting wor
 
 Unlike standard wrapper applications, I.Atlas features a robust, multi-process architecture handling asynchronous document processing, semantic search, and a strict hybrid extraction pipeline.
 
-## System Architecture
+##  System Architecture
 
 The platform operates on a microservices-oriented architecture to ensure scalability and separation of concerns.
 
