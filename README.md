@@ -33,7 +33,7 @@ graph TD
     Client -- Queries Status / Data --> FastAPI
     FastAPI -- Reads Validated Data --> PG
 
-The Hybrid Extraction Pipeline
+## The Hybrid Extraction Pipeline
 A core engineering decision in I.Atlas is the refusal to rely solely on Large Language Models for deterministic financial data. The extraction pipeline is multi-layered, prioritizing speed, cost-efficiency, and absolute deterministic accuracy before falling back to AI:
 
 Direct Parsers & Structural OCR: Attempts to read standard structural formats (e.g., specific ERP outputs).
@@ -44,7 +44,7 @@ LLM Fallback (Groq / OpenAI): Only invoked for highly unstructured layouts, comp
 
 Mathematical Arbitration: A strict Pandas-powered validation layer cross-references all extracted values (ensuring Base + Tax == Total). Anomalies flag the document for human-in-the-loop (HITL) review.
 
-Tech Stack
+## Tech Stack
 Backend: Python, FastAPI, SQLAlchemy, Alembic.
 
 Asynchronous Processing: Celery, Redis.
@@ -53,13 +53,13 @@ Database: PostgreSQL (with pgvector for semantic embeddings).
 
 Frontend: Streamlit.
 
-Infrastructure & DevOps: Docker, Docker Compose, AWS S3, GitHub Actions.
+## Infrastructure & DevOps: Docker, Docker Compose, AWS S3, GitHub Actions.
 
 Testing: pytest (Isolated suites without external service dependencies).
 
-Technical Demonstration (Pipeline Mock)
+## Technical Demonstration (Pipeline Mock)
 To see the hybrid pipeline logic in action without external API keys, run the isolated test suite utilizing mock data:
 
-Bash
+## Bash
 # Run the test suite
 pytest tests/test_pipeline_demo.py -v
