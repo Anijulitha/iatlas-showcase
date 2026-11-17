@@ -1,3 +1,4 @@
+```markdown
 # I.Atlas - Intelligent Financial Extraction & Auditing Engine
 
 > **Note:** This is a sanitized showcase repository demonstrating the architecture and engineering principles behind I.Atlas. Proprietary business logic, advanced regex patterns, and production prompts have been redacted.
